@@ -442,6 +442,88 @@ static void ring_write_tail(struct intel_engine_cs *ring,
 	I915_WRITE_TAIL(ring, value);
 }
 
+int intel_ring_disable(struct intel_engine_cs *ring)
+{
+	WARN_ON(!ring);
+
+	if (ring && ring->disable)
+		return ring->disable(ring);
+	else {
+		DRM_ERROR("Ring disable not supported on %s\n", ring->name);
+		return -EINVAL;
+	}
+}
+
+int intel_ring_enable(struct intel_engine_cs *ring)
+{
+	WARN_ON(!ring);
+
+	if (ring && ring->enable)
+		return ring->enable(ring);
+	else {
+		DRM_ERROR("Ring enable not supported on %s\n", ring->name);
+		return -EINVAL;
+	}
+}
+
+int intel_ring_save(struct intel_engine_cs *ring,
+		struct drm_i915_gem_request *req,
+		bool force_advance)
+{
+	WARN_ON(!ring);
+
+	if (ring && ring->save)
+		return ring->save(ring, req, force_advance);
+	else {
+		DRM_ERROR("Ring save not supported on %s\n", ring->name);
+		return -EINVAL;
+	}
+}
+
+int intel_ring_restore(struct intel_engine_cs *ring,
+		struct drm_i915_gem_request *req)
+{
+	WARN_ON(!ring);
+
+	if (ring && ring->restore)
+		return ring->restore(ring, req);
+	else {
+		DRM_ERROR("Ring restore not supported on %s\n", ring->name);
+		return -EINVAL;
+	}
+}
+
+void intel_gpu_engine_reset_resample(struct intel_engine_cs *ring,
+		struct drm_i915_gem_request *req)
+{
+	struct intel_ringbuffer *ringbuf;
+	struct drm_i915_private *dev_priv;
+
+	if (WARN_ON(!ring))
+		return;
+
+	dev_priv = ring->dev->dev_private;
+
+	if (i915.enable_execlists) {
+		struct intel_context *ctx;
+
+		if (WARN_ON(!req))
+			return;
+
+		ctx = req->ctx;
+		ringbuf = ctx->engine[ring->id].ringbuf;
+
+		/*
+		 * In gen8+ context head is restored during reset and
+		 * we can use it as a reference to set up the new
+		 * driver state.
+		 */
+		I915_READ_HEAD_CTX(ring, ctx, ringbuf->head);
+		ringbuf->last_retired_head = -1;
+		intel_ring_update_space(ringbuf);
+	}
+}
+
 u64 intel_ring_get_active_head(struct intel_engine_cs *ring)
 {
 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
@@ -637,7 +719,7 @@ static int init_ring_common(struct intel_engine_cs *ring)
 	ringbuf->tail = I915_READ_TAIL(ring) & TAIL_ADDR;
 	intel_ring_update_space(ringbuf);
 
-	memset(&ring->hangcheck, 0, sizeof(ring->hangcheck));
+	i915_hangcheck_reinit(ring);
 
 out:
 	intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);

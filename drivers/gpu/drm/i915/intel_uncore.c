@@ -1478,6 +1478,214 @@ int intel_gpu_reset(struct drm_device *dev)
 	return ret;
 }
 
+static inline int wait_for_engine_reset(struct drm_i915_private *dev_priv,
+		unsigned int grdom)
+{
+#define _CND ((__raw_i915_read32(dev_priv, GEN6_GDRST) & grdom) == 0)
+
+	/*
+	 * Spin waiting for the device to ack the reset request.
+	 * Times out after 500 us
+	 * */
+	return wait_for_atomic_us(_CND, 500);
+
+#undef _CND
+}
+
+static int do_engine_reset_nolock(struct intel_engine_cs *engine)
+{
+	int ret = -ENODEV;
+	struct drm_i915_private *dev_priv = engine->dev->dev_private;
+
+	assert_spin_locked(&dev_priv->uncore.lock);
+
+	switch (engine->id) {
+	case RCS:
+		__raw_i915_write32(dev_priv, GEN6_GDRST, GEN6_GRDOM_RENDER);
+		engine->hangcheck.reset_count++;
+		ret = wait_for_engine_reset(dev_priv, GEN6_GRDOM_RENDER);
+		break;
+
+	case BCS:
+		__raw_i915_write32(dev_priv, GEN6_GDRST, GEN6_GRDOM_BLT);
+		engine->hangcheck.reset_count++;
+		ret = wait_for_engine_reset(dev_priv, GEN6_GRDOM_BLT);
+		break;
+
+	case VCS:
+		__raw_i915_write32(dev_priv, GEN6_GDRST, GEN6_GRDOM_MEDIA);
+		engine->hangcheck.reset_count++;
+		ret = wait_for_engine_reset(dev_priv, GEN6_GRDOM_MEDIA);
+		break;
+
+	case VECS:
+		__raw_i915_write32(dev_priv, GEN6_GDRST, GEN6_GRDOM_VECS);
+		engine->hangcheck.reset_count++;
+		ret = wait_for_engine_reset(dev_priv, GEN6_GRDOM_VECS);
+		break;
+
+	case VCS2:
+		__raw_i915_write32(dev_priv, GEN6_GDRST, GEN8_GRDOM_MEDIA2);
+		engine->hangcheck.reset_count++;
+		ret = wait_for_engine_reset(dev_priv, GEN8_GRDOM_MEDIA2);
+		break;
+
+	default:
+		DRM_ERROR("Unexpected engine: %d\n", engine->id);
+		break;
+	}
+
+	return ret;
+}
+
+static int gen8_do_engine_reset(struct intel_engine_cs *engine)
+{
+	struct drm_device *dev = engine->dev;
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	int ret = -ENODEV;
+	unsigned long irqflags;
+	u32 reset_ctl = 0;
+
+	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
+	ret = do_engine_reset_nolock(engine);
+	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
+
+	if (!ret) {
+		char *reset_event[2];
+
+		/* Do uevent outside of spinlock as uevent can sleep */
+		reset_event[1] = NULL;
+		reset_event[0] = kasprintf(GFP_KERNEL, "RESET RING=%d", engine->id);
+		kobject_uevent_env(&dev->primary->kdev->kobj,
+			KOBJ_CHANGE, reset_event);
+		kfree(reset_event[0]);
+
+		/*
+		 * Confirm that reset control register back to normal
+		 * following the reset.
+		 */
+		reset_ctl = I915_READ(RING_RESET_CTL(engine));
+		WARN(reset_ctl & 0x3, "Reset control still active after reset! (0x%08x)\n",
+			reset_ctl);
+
+	} else {
+		DRM_ERROR("Engine reset failed! (%d)\n", ret);
+	}
+
+	return ret;
+}
+
+int intel_gpu_engine_reset(struct intel_engine_cs *engine)
+{
+	/* Reset an individual engine */
+	int ret = -ENODEV;
+	struct drm_device *dev = engine->dev;
+
+	switch (INTEL_INFO(dev)->gen) {
+	case 8:
+		ret = gen8_do_engine_reset(engine);
+		break;
+	default:
+		DRM_ERROR("Per Engine Reset not supported on Gen%d\n",
+			  INTEL_INFO(dev)->gen);
+		ret = -ENODEV;
+		break;
+	}
+
+	return ret;
+}
+
+static int gen8_request_engine_reset(struct intel_engine_cs *engine)
+{
+	int ret = 0;
+	unsigned long irqflags;
+	u32 reset_ctl = 0;
+	struct drm_i915_private *dev_priv = engine->dev->dev_private;
+
+	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
+
+	/*
+	 * Initiate reset handshake by requesting reset from the
+	 * reset control register.
+	 */
+	__raw_i915_write32(dev_priv, RING_RESET_CTL(engine),
+		_MASKED_BIT_ENABLE(REQUEST_RESET));
+
+	/*
+	 * Wait for ready to reset ack.
+	 */
+	ret = wait_for_atomic_us((__raw_i915_read32(dev_priv,
+		RING_RESET_CTL(engine)) & READY_FOR_RESET) ==
+			READY_FOR_RESET, 500);
+
+	reset_ctl = __raw_i915_read32(dev_priv, RING_RESET_CTL(engine));
+
+	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
+
+	WARN(ret, "Reset request failed! (err=%d, reset control=0x%08x)\n",
+		ret, reset_ctl);
+
+	return ret;
+}
+
+static int gen8_unrequest_engine_reset(struct intel_engine_cs *engine)
+{
+	struct drm_i915_private *dev_priv = engine->dev->dev_private;
+
+	I915_WRITE(RING_RESET_CTL(engine), _MASKED_BIT_DISABLE(REQUEST_RESET));
+	return 0;
+}
+
+/*
+ * On gen8+ a reset request has to be issued via the reset control register
+ * before a GPU engine can be reset in order to stop the command streamer
+ * and idle the engine. This replaces the legacy way of stopping an engine
+ * by writing to the stop ring bit in the MI_MODE register.
+ */
+int intel_request_gpu_engine_reset(struct intel_engine_cs *engine)
+{
+	/* Request reset for an individual engine */
+	int ret = -ENODEV;
+	struct drm_device *dev;
+
+	if (WARN_ON(!engine))
+		return -EINVAL;
+
+	dev = engine->dev;
+
+	if (INTEL_INFO(dev)->gen >= 8)
+		ret = gen8_request_engine_reset(engine);
+	else
+		DRM_ERROR("Reset request not supported on Gen%d\n",
+			  INTEL_INFO(dev)->gen);
+
+	return ret;
+}
+
+/*
+ * It is possible to back off from a previously issued reset request by simply
+ * clearing the reset request bit in the reset control register.
+ */
+int intel_unrequest_gpu_engine_reset(struct intel_engine_cs *engine)
+{
+	/* Request reset for an individual engine */
+	int ret = -ENODEV;
+	struct drm_device *dev;
+
+	if (WARN_ON(!engine))
+		return -EINVAL;
+
+	dev = engine->dev;
+
+	if (INTEL_INFO(dev)->gen >= 8)
+		ret = gen8_unrequest_engine_reset(engine);
+	else
+		DRM_ERROR("Reset unrequest not supported on Gen%d\n",
+			  INTEL_INFO(dev)->gen);
+
+	return ret;
+}
+
 void intel_uncore_check_errors(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;

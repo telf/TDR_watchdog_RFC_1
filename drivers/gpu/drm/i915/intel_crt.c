@@ -747,7 +747,7 @@ static int intel_crt_get_modes(struct drm_connector *connector)
 		goto out;
 
 	/* Try to probe digital port for output in DVI-I -> VGA mode. */
-	i2c = intel_gmbus_get_adapter(dev_priv, GMBUS_PORT_DPB);
+	i2c = intel_gmbus_get_adapter(dev_priv, GMBUS_PIN_DPB);
 	ret = intel_crt_ddc_get_modes(connector, i2c);
 
 out:
@@ -851,7 +851,7 @@ void intel_crt_init(struct drm_device *dev)
 	if (!crt)
 		return;
 
-	intel_connector = kzalloc(sizeof(*intel_connector), GFP_KERNEL);
+	intel_connector = intel_connector_alloc();
 	if (!intel_connector) {
 		kfree(crt);
 		return;

@@ -50,6 +50,7 @@ struct i915_params i915 __read_mostly = {
 	.enable_cmd_parser = 1,
 	.disable_vtd_wa = 0,
 	.use_mmio_flip = 0,
+	.gpu_reset_promotion_time = 0,
 	.mmio_debug = 0,
 	.verbose_state_checks = 1,
 	.nuclear_pageflip = 0,
@@ -171,6 +172,15 @@ MODULE_PARM_DESC(enable_cmd_parser,
 module_param_named(use_mmio_flip, i915.use_mmio_flip, int, 0600);
 MODULE_PARM_DESC(use_mmio_flip,
 		 "use MMIO flips (-1=never, 0=driver discretion [default], 1=always)");
+
+module_param_named(gpu_reset_promotion_time,
+               i915.gpu_reset_promotion_time, int, 0644);
+MODULE_PARM_DESC(gpu_reset_promotion_time,
+               "Catch excessive engine resets. Each engine maintains a "
+	       "timestamp of the last time it was reset. If it hangs again "
+	       "within this period then fall back to full GPU reset to try and"
+	       " recover from the hang. "
+               "default=0 seconds (disabled)");
 
 module_param_named(mmio_debug, i915.mmio_debug, int, 0600);
 MODULE_PARM_DESC(mmio_debug,

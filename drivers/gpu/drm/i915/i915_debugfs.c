@@ -4183,7 +4183,7 @@ i915_wedged_set(void *data, u64 val)
 
 	intel_runtime_pm_get(dev_priv);
 
-	i915_handle_error(dev, val,
+	i915_handle_error(dev, 0x0, val,
 			  "Manually setting wedged to %llu", val);
 
 	intel_runtime_pm_put(dev_priv);

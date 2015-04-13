@@ -34,6 +34,7 @@
 #include "i915_drv.h"
 #include "i915_trace.h"
 #include "intel_drv.h"
+#include "intel_lrc_tdr.h"
 
 #include <linux/console.h>
 #include <linux/module.h>
@@ -581,6 +582,7 @@ static int i915_drm_suspend(struct drm_device *dev)
 	struct drm_crtc *crtc;
 	pci_power_t opregion_target_state;
 	int error;
+	int i;
 
 	/* ignore lid events during suspend */
 	mutex_lock(&dev_priv->modeset_restore_lock);
@@ -601,6 +603,16 @@ static int i915_drm_suspend(struct drm_device *dev)
 			"GEM idle failed, resume might fail\n");
 		return error;
 	}
+
+	/*
+	 * Clear any pending reset requests. They should be picked up
+	 * after resume when new work is submitted
+	 */
+	for (i = 0; i < I915_NUM_RINGS; i++)
+		atomic_set(&dev_priv->ring[i].hangcheck.flags, 0);
+
+	atomic_clear_mask(I915_RESET_IN_PROGRESS_FLAG,
+		&dev_priv->gpu_error.reset_counter);
 
 	intel_suspend_gt_powersave(dev);
 
@@ -903,6 +915,192 @@ int i915_reset(struct drm_device *dev)
 		intel_enable_gt_powersave(dev);
 
 	return 0;
+}
+
+/**
+ * i915_reset_engine - reset GPU engine after a hang
+ * @engine: engine to reset
+ *
+ * Reset a specific GPU engine. Useful if a hang is detected. Returns zero on successful
+ * reset or otherwise an error code.
+ *
+ * Procedure is fairly simple:
+ *
+ *	- Force engine to idle.
+ *
+ *	- Save current head register value and nudge it past the point of the hang in the
+ *	  ring buffer, which is typically the BB_START instruction of the hung batch buffer,
+ *	  on to the following instruction.
+ *
+ *	- Reset engine.
+ *
+ *	- Restore the previously saved, nudged head register value.
+ *
+ *	- Re-enable engine to resume running. On gen8 this requires the previously hung
+ *	  context to be resubmitted to ELSP via the dedicated TDR-execlists interface.
+ *
+ */
+int i915_reset_engine(struct intel_engine_cs *engine)
+{
+	struct drm_device *dev = engine->dev;
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	struct drm_i915_gem_request *current_request = NULL;
+	uint32_t head;
+	bool force_advance = false;
+	int ret = 0;
+	int err_ret = 0;
+
+	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
+
+        /* Take wake lock to prevent power saving mode */
+	intel_uncore_forcewake_get(dev_priv, FORCEWAKE_ALL);
+
+	i915_gem_reset_ring_status(dev_priv, engine);
+
+	if (i915.enable_execlists) {
+		enum context_submission_status status =
+			intel_execlists_TDR_get_current_request(engine, NULL);
+
+		/*
+		 * If the hardware and driver states do not coincide
+		 * or if there for some reason is no current context
+		 * in the process of being submitted then bail out and
+		 * try again. Do not proceed unless we have reliable
+		 * current context state information.
+		 */
+		if (status != CONTEXT_SUBMISSION_STATUS_OK) {
+			ret = -EAGAIN;
+			goto reset_engine_error;
+		}
+	}
+
+	ret = intel_ring_disable(engine);
+	if (ret != 0) {
+		DRM_ERROR("Failed to disable %s\n", engine->name);
+		goto reset_engine_error;
+	}
+
+	if (i915.enable_execlists) {
+		enum context_submission_status status;
+		bool inconsistent;
+
+		status = intel_execlists_TDR_get_current_request(engine,
+				&current_request);
+
+		inconsistent = (status != CONTEXT_SUBMISSION_STATUS_OK);
+		if (inconsistent) {
+			/*
+			 * If we somehow have reached this point with
+			 * an inconsistent context submission status then
+			 * back out of the previously requested reset and
+			 * retry later.
+			 */
+			WARN(inconsistent,
+			     "Inconsistent context status on %s: %u\n",
+			     engine->name, status);
+
+			ret = -EAGAIN;
+			goto reenable_reset_engine_error;
+		}
+	}
+
+	/* Sample the current ring head position */
+	head = I915_READ_HEAD(engine) & HEAD_ADDR;
+
+	if (head == engine->hangcheck.last_head) {
+		/*
+		 * The engine has not advanced since the last
+		 * time it hung so force it to advance to the
+		 * next QWORD. In most cases the engine head
+		 * pointer will automatically advance to the
+		 * next instruction as soon as it has read the
+		 * current instruction, without waiting for it
+		 * to complete. This seems to be the default
+		 * behaviour, however an MBOX wait inserted
+		 * directly to the VCS/BCS engines does not behave
+		 * in the same way, instead the head pointer
+		 * will still be pointing at the MBOX instruction
+		 * until it completes.
+		 */
+		force_advance = true;
+	}
+
+	engine->hangcheck.last_head = head;
+
+	ret = intel_ring_save(engine, current_request, force_advance);
+	if (ret) {
+		DRM_ERROR("Failed to save %s engine state\n", engine->name);
+		goto reenable_reset_engine_error;
+	}
+
+	ret = intel_gpu_engine_reset(engine);
+	if (ret) {
+		DRM_ERROR("Failed to reset %s\n", engine->name);
+		goto reenable_reset_engine_error;
+	}
+
+	ret = intel_ring_restore(engine, current_request);
+	if (ret) {
+		DRM_ERROR("Failed to restore %s engine state\n", engine->name);
+		goto reenable_reset_engine_error;
+	}
+
+	/* Correct driver state */
+	intel_gpu_engine_reset_resample(engine, current_request);
+
+	/*
+	 * Reenable engine
+	 *
+	 * In execlist mode on gen8+ this is implicit by simply resubmitting
+	 * the previously hung context. In ring buffer submission mode on gen7
+	 * and earlier we need to actively turn on the engine first.
+	 */
+	if (i915.enable_execlists)
+		intel_execlists_TDR_context_resubmission(engine);
+	else
+		ret = intel_ring_enable(engine);
+
+	if (ret) {
+		DRM_ERROR("Failed to enable %s again after reset\n",
+			engine->name);
+
+		goto reset_engine_error;
+	}
+
+	/* Clear reset flags to allow future hangchecks */
+	atomic_set(&engine->hangcheck.flags, 0);
+
+	/* Wake up anything waiting on this engine's queue */
+	wake_up_all(&engine->irq_queue);
+
+	if (i915.enable_execlists && current_request)
+		i915_gem_request_unreference(current_request);
+
+	intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
+
+	return ret;
+
+reenable_reset_engine_error:
+
+	err_ret = intel_ring_enable(engine);
+	if (err_ret)
+		DRM_ERROR("Failed to reenable %s following error during reset (%d)\n",
+			engine->name, err_ret);
+
+reset_engine_error:
+
+	/* Clear reset flags to allow future hangchecks */
+	atomic_set(&engine->hangcheck.flags, 0);
+
+	/* Wake up anything waiting on this engine's queue */
+	wake_up_all(&engine->irq_queue);
+
+	if (i915.enable_execlists && current_request)
+		i915_gem_request_unreference(current_request);
+
+	intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
+
+	return ret;
 }
 
 static int i915_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)

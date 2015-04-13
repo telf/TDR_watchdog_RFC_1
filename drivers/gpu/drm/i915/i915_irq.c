@@ -2312,9 +2312,69 @@ static void i915_reset_and_wakeup(struct drm_device *dev)
 	char *error_event[] = { I915_ERROR_UEVENT "=1", NULL };
 	char *reset_event[] = { I915_RESET_UEVENT "=1", NULL };
 	char *reset_done_event[] = { I915_ERROR_UEVENT "=0", NULL };
-	int ret;
+	bool reset_complete = false;
+	struct intel_engine_cs *ring;
+	int ret = 0;
+	int i;
+
+	mutex_lock(&dev->struct_mutex);
 
 	kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, error_event);
+
+	for_each_ring(ring, dev_priv, i) {
+
+		/*
+		 * Skip further individual engine reset requests if full GPU
+		 * reset requested.
+		 */
+		if (i915_reset_in_progress(error))
+			break;
+
+		if (atomic_read(&ring->hangcheck.flags) &
+			I915_ENGINE_RESET_IN_PROGRESS) {
+
+			if (!reset_complete)
+				kobject_uevent_env(&dev->primary->kdev->kobj,
+						   KOBJ_CHANGE,
+						   reset_event);
+
+			reset_complete = true;
+
+			ret = i915_reset_engine(ring);
+
+			/*
+			 * Execlist mode only:
+			 *
+			 * -EAGAIN means that between detecting a hang (and
+			 * also determining that the currently submitted
+			 * context is stable and valid) and trying to recover
+			 * from the hang the current context changed state.
+			 * This means that we are probably not completely hung
+			 * after all. Just fail and retry by exiting all the
+			 * way back and wait for the next hang detection. If we
+			 * have a true hang on our hands then we will detect it
+			 * again, otherwise we will continue like nothing
+			 * happened.
+			 */
+			if (ret == -EAGAIN) {
+				DRM_ERROR("Reset of %s aborted due to " \
+					  "change in context submission " \
+					  "state - retrying!", ring->name);
+				ret = 0;
+			}
+
+			if (ret) {
+				DRM_ERROR("Reset of %s failed! (%d)", ring->name, ret);
+
+				atomic_set_mask(I915_RESET_IN_PROGRESS_FLAG,
+						&dev_priv->gpu_error.reset_counter);
+				break;
+			}
+		}
+	}
+
+	/* The full GPU reset will grab the struct_mutex when it needs it */
+	mutex_unlock(&dev->struct_mutex);
 
 	/*
 	 * Note that there's only one work item which does gpu resets, so we
@@ -2328,8 +2388,13 @@ static void i915_reset_and_wakeup(struct drm_device *dev)
 	 */
 	if (i915_reset_in_progress(error) && !i915_terminally_wedged(error)) {
 		DRM_DEBUG_DRIVER("resetting chip\n");
-		kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE,
-				   reset_event);
+
+		if (!reset_complete)
+			kobject_uevent_env(&dev->primary->kdev->kobj,
+					   KOBJ_CHANGE,
+					   reset_event);
+
+		reset_complete = true;
 
 		/*
 		 * In most cases it's guaranteed that we get here with an RPM
@@ -2362,23 +2427,36 @@ static void i915_reset_and_wakeup(struct drm_device *dev)
 			 *
 			 * Since unlock operations are a one-sided barrier only,
 			 * we need to insert a barrier here to order any seqno
-			 * updates before
-			 * the counter increment.
+			 * updates before the counter increment.
+			 *
+			 * The increment clears I915_RESET_IN_PROGRESS_FLAG.
 			 */
 			smp_mb__before_atomic();
 			atomic_inc(&dev_priv->gpu_error.reset_counter);
 
-			kobject_uevent_env(&dev->primary->kdev->kobj,
-					   KOBJ_CHANGE, reset_done_event);
+			/*
+			 * If any per-engine resets were promoted to full GPU
+			 * reset don't forget to clear those reset flags.
+			 */
+			for_each_ring(ring, dev_priv, i)
+				atomic_set(&ring->hangcheck.flags, 0);
 		} else {
+			/* Terminal wedge condition */
+			WARN(1, "i915_reset failed, declaring GPU as wedged!\n");
 			atomic_set_mask(I915_WEDGED, &error->reset_counter);
 		}
+	}
 
-		/*
-		 * Note: The wake_up also serves as a memory barrier so that
-		 * waiters see the update value of the reset counter atomic_t.
-		 */
+	/*
+	 * Note: The wake_up also serves as a memory barrier so that
+	 * waiters see the update value of the reset counter atomic_t.
+	 */
+	if (reset_complete) {
 		i915_error_wake_up(dev_priv, true);
+
+		if (ret == 0)
+			kobject_uevent_env(&dev->primary->kdev->kobj,
+					   KOBJ_CHANGE, reset_done_event);
 	}
 }
 
@@ -2476,20 +2554,41 @@ static void i915_report_and_clear_eir(struct drm_device *dev)
 
 /**
  * i915_handle_error - handle a gpu error
- * @dev: drm device
  *
- * Do some basic checking of regsiter state at error time and
+ * @dev: 		drm device
+ *
+ * @engine_mask: 	Bit mask containing the engine flags of all engines
+ *			associated with one or more detected errors.
+ *			May be 0x0.
+ *
+ *			If wedged is set to true this implies that one or more
+ *			engine hangs were detected. In this case we will
+ *			attempt to reset all engines that have been detected
+ *			as hung.
+ *
+ *			If a previous engine reset was attempted too recently
+ *			or if one of the current engine resets fails we fall
+ *			back to legacy full GPU reset.
+ *
+ * @wedged: 		true = Hang detected, invoke hang recovery.
+ * @fmt, ...: 		Error message describing reason for error.
+ *
+ * Do some basic checking of register state at error time and
  * dump it to the syslog.  Also call i915_capture_error_state() to make
  * sure we get a record and make it available in debugfs.  Fire a uevent
  * so userspace knows something bad happened (should trigger collection
- * of a ring dump etc.).
+ * of a ring dump etc.). If a hang was detected (wedged = true) try to
+ * reset the associated engine. Failing that, try to fall back to legacy
+ * full GPU reset recovery mode.
  */
-void i915_handle_error(struct drm_device *dev, bool wedged,
+void i915_handle_error(struct drm_device *dev, u32 engine_mask, bool wedged,
 		       const char *fmt, ...)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	va_list args;
 	char error_msg[80];
+
+	struct intel_engine_cs *engine;
 
 	va_start(args, fmt);
 	vscnprintf(error_msg, sizeof(error_msg), fmt, args);
@@ -2499,8 +2598,59 @@ void i915_handle_error(struct drm_device *dev, bool wedged,
 	i915_report_and_clear_eir(dev);
 
 	if (wedged) {
-		atomic_set_mask(I915_RESET_IN_PROGRESS_FLAG,
-				&dev_priv->gpu_error.reset_counter);
+		/*
+		 * Defer to full GPU reset if any of the following is true:
+		 * 	1. The caller did not ask for per-engine reset.
+		 *	2. The hardware does not support it (pre-gen7).
+		 *	3. We already tried per-engine reset recently.
+		 */
+		bool full_reset = true;
+
+		/*
+		 * TBD: We currently only support per-engine reset for gen8+.
+		 * Implement support for gen7.
+		 */
+		if (engine_mask && (INTEL_INFO(dev)->gen >= 8)) {
+			u32 i;
+
+			for_each_ring(engine, dev_priv, i) {
+				u32 now, last_engine_reset_timediff;
+
+				if (!(intel_ring_flag(engine) & engine_mask))
+					continue;
+
+				/* Measure the time since this engine was last reset */
+				now = get_seconds();
+				last_engine_reset_timediff =
+					now - engine->hangcheck.last_engine_reset_time;
+
+				full_reset = last_engine_reset_timediff <
+					i915.gpu_reset_promotion_time;
+
+				engine->hangcheck.last_engine_reset_time = now;
+
+				/*
+				 * This engine was not reset too recently - go ahead
+				 * with engine reset instead of falling back to full
+				 * GPU reset.
+				 *
+				 * Flag that we want to try and reset this engine.
+				 * This can still be overridden by a global
+				 * reset e.g. if per-engine reset fails.
+				 */
+				if (!full_reset)
+					atomic_set_mask(I915_ENGINE_RESET_IN_PROGRESS,
+						&engine->hangcheck.flags);
+				else
+					break;
+
+			} /* for_each_ring */
+		}
+
+		if (full_reset) {
+			atomic_set_mask(I915_RESET_IN_PROGRESS_FLAG,
+					&dev_priv->gpu_error.reset_counter);
+		}
 
 		/*
 		 * Wakeup waiting processes so that the reset function
@@ -2823,7 +2973,7 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
 	 */
 	tmp = I915_READ_CTL(ring);
 	if (tmp & RING_WAIT) {
-		i915_handle_error(dev, false,
+		i915_handle_error(dev, intel_ring_flag(ring), false,
 				  "Kicking stuck wait on %s",
 				  ring->name);
 		I915_WRITE_CTL(ring, tmp);
@@ -2835,7 +2985,7 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
 		default:
 			return HANGCHECK_HUNG;
 		case 1:
-			i915_handle_error(dev, false,
+			i915_handle_error(dev, intel_ring_flag(ring), false,
 					  "Kicking stuck semaphore on %s",
 					  ring->name);
 			I915_WRITE_CTL(ring, tmp);
@@ -2864,7 +3014,8 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 	struct drm_device *dev = dev_priv->dev;
 	struct intel_engine_cs *ring;
 	int i;
-	int busy_count = 0, rings_hung = 0;
+	u32 engine_mask = 0;
+	int busy_count = 0;
 	bool stuck[I915_NUM_RINGS] = { 0 };
 #define BUSY 1
 #define KICK 5
@@ -2960,12 +3111,14 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 			DRM_INFO("%s on %s\n",
 				 stuck[i] ? "stuck" : "no progress",
 				 ring->name);
-			rings_hung++;
+
+			engine_mask |= intel_ring_flag(ring);
+			ring->hangcheck.tdr_count++;
 		}
 	}
 
-	if (rings_hung)
-		return i915_handle_error(dev, true, "Ring hung");
+	if (engine_mask)
+		i915_handle_error(dev, engine_mask, true, "Ring hung (0x%02x)", engine_mask);
 
 	if (busy_count)
 		/* Reset timer case chip hangs without another request

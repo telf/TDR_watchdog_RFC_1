@@ -100,6 +100,10 @@
 #define  GRDOM_RESET_STATUS (1<<1)
 #define  GRDOM_RESET_ENABLE (1<<0)
 
+#define RING_RESET_CTL(ring)	((ring)->mmio_base+0xd0)
+#define  READY_FOR_RESET	0x2
+#define  REQUEST_RESET		0x1
+
 #define ILK_GDSR 0x2ca4 /* MCHBAR offset */
 #define  ILK_GRDOM_FULL		(0<<1)
 #define  ILK_GRDOM_RENDER	(1<<1)
@@ -130,6 +134,8 @@
 #define  GEN6_GRDOM_RENDER		(1 << 1)
 #define  GEN6_GRDOM_MEDIA		(1 << 2)
 #define  GEN6_GRDOM_BLT			(1 << 3)
+#define  GEN6_GRDOM_VECS		(1 << 4)
+#define  GEN8_GRDOM_MEDIA2		(1 << 7)
 
 #define RING_PP_DIR_BASE(ring)		((ring)->mmio_base+0x228)
 #define RING_PP_DIR_BASE_READ(ring)	((ring)->mmio_base+0x518)

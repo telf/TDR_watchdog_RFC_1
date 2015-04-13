@@ -135,6 +135,7 @@
 #include <drm/drmP.h>
 #include <drm/i915_drm.h>
 #include "i915_drv.h"
+#include "intel_lrc_tdr.h"
 
 #define GEN9_LR_CONTEXT_RENDER_SIZE (22 * PAGE_SIZE)
 #define GEN8_LR_CONTEXT_RENDER_SIZE (20 * PAGE_SIZE)
@@ -330,6 +331,164 @@ static void execlists_elsp_write(struct intel_engine_cs *ring,
 	spin_unlock(&dev_priv->uncore.lock);
 }
 
+/**
+ * execlist_get_context_reg_page() - Get memory page for context object
+ * @engine: engine
+ * @ctx: context running on engine
+ * @page: returned page
+ *
+ * Return: 0 if successful, otherwise propagates error codes.
+ */
+static inline int execlist_get_context_reg_page(struct intel_engine_cs *engine,
+		struct intel_context *ctx,
+		struct page **page)
+{
+	struct drm_i915_gem_object *ctx_obj;
+
+	if (!page)
+		return -EINVAL;
+
+	if (!ctx)
+		ctx = engine->default_context;
+
+	ctx_obj = ctx->engine[engine->id].state;
+
+	if (WARN(!ctx_obj, "Context object not set up!\n"))
+		return -EINVAL;
+
+	WARN(!i915_gem_obj_is_pinned(ctx_obj),
+	     "Context object is not pinned!\n");
+
+	*page = i915_gem_object_get_page(ctx_obj, 1);
+
+	if (WARN(!*page, "Context object page could not be resolved!\n"))
+		return -EINVAL;
+
+	return 0;
+}
+
+/**
+ * execlist_write_context_reg() - Write value to context register
+ * @engine: engine
+ * @ctx: context running on engine
+ * @ctx_reg: Index into context image pointing to register location
+ * @mmio_reg_addr: MMIO register address
+ * @val: Value to be written
+ *
+ * Return: 0 if successful, otherwise propagates error codes.
+ */
+static inline int execlists_write_context_reg(struct intel_engine_cs *engine,
+		struct intel_context *ctx, u32 ctx_reg, u32 mmio_reg_addr,
+		u32 val)
+{
+	struct page *page = NULL;
+	uint32_t *reg_state;
+
+	int ret = execlist_get_context_reg_page(engine, ctx, &page);
+	if (WARN(ret, "Failed to write %u to register %u for %s!\n",
+		(unsigned int) val, (unsigned int) ctx_reg, engine->name))
+			return ret;
+
+	reg_state = kmap_atomic(page);
+
+	WARN(reg_state[ctx_reg] != mmio_reg_addr,
+	     "Context register address (%x) != MMIO register address (%x)!\n",
+	     (unsigned int) reg_state[ctx_reg], (unsigned int) mmio_reg_addr);
+
+	reg_state[ctx_reg+1] = val;
+	kunmap_atomic(reg_state);
+
+	return ret;
+}
+
+/**
+ * execlist_read_context_reg() - Read value from context register
+ * @engine: engine
+ * @ctx: context running on engine
+ * @ctx_reg: Index into context image pointing to register location
+ * @mmio_reg_addr: MMIO register address
+ * @val: Output parameter returning register value
+ *
+ * Return: 0 if successful, otherwise propagates error codes.
+ */
+static inline int execlists_read_context_reg(struct intel_engine_cs *engine,
+		struct intel_context *ctx, u32 ctx_reg, u32 mmio_reg_addr,
+		u32 *val)
+{
+	struct page *page = NULL;
+	uint32_t *reg_state;
+	int ret = 0;
+
+	if (!val)
+		return -EINVAL;
+
+	ret = execlist_get_context_reg_page(engine, ctx, &page);
+	if (WARN(ret, "Failed to read from register %u for %s!\n",
+		(unsigned int) ctx_reg, engine->name))
+			return ret;
+
+	reg_state = kmap_atomic(page);
+
+	WARN(reg_state[ctx_reg] != mmio_reg_addr,
+	     "Context register address (%x) != MMIO register address (%x)!\n",
+	     (unsigned int) reg_state[ctx_reg], (unsigned int) mmio_reg_addr);
+
+	*val = reg_state[ctx_reg+1];
+	kunmap_atomic(reg_state);
+
+	return ret;
+ }
+
+/*
+ * Generic macros for generating function implementation for context register
+ * read/write functions.
+ *
+ * Macro parameters
+ * ----------------
+ * reg_name: Designated name of context register (e.g. tail, head, buffer_ctl)
+ *
+ * reg_def: Context register macro definition (e.g. CTX_RING_TAIL)
+ *
+ * mmio_reg_def: Name of macro function used to determine the address
+ *		 of the corresponding MMIO register (e.g. RING_TAIL, RING_HEAD).
+ *		 This macro function is assumed to be defined on the form of:
+ *
+ *			#define mmio_reg_def(base) (base+register_offset)
+ *
+ *		 Where "base" is the MMIO base address of the respective ring
+ *		 and "register_offset" is the offset relative to "base".
+ *
+ * Function parameters
+ * -------------------
+ * engine: The engine that the context is running on
+ * ctx: The context of the register that is to be accessed
+ * reg_name: Value to be written/read to/from the register.
+ */
+#define INTEL_EXECLISTS_WRITE_REG(reg_name, reg_def, mmio_reg_def) \
+	int intel_execlists_write_##reg_name(struct intel_engine_cs *engine, \
+					     struct intel_context *ctx, \
+					     u32 reg_name) \
+{ \
+	return execlists_write_context_reg(engine, ctx, (reg_def), \
+			mmio_reg_def(engine->mmio_base), (reg_name)); \
+}
+
+#define INTEL_EXECLISTS_READ_REG(reg_name, reg_def, mmio_reg_def) \
+	int intel_execlists_read_##reg_name(struct intel_engine_cs *engine, \
+					    struct intel_context *ctx, \
+					    u32 *reg_name) \
+{ \
+	return execlists_read_context_reg(engine, ctx, (reg_def), \
+			mmio_reg_def(engine->mmio_base), (reg_name)); \
+}
+
+INTEL_EXECLISTS_READ_REG(tail, CTX_RING_TAIL, RING_TAIL)
+INTEL_EXECLISTS_WRITE_REG(head, CTX_RING_HEAD, RING_HEAD)
+INTEL_EXECLISTS_READ_REG(head, CTX_RING_HEAD, RING_HEAD)
+
+#undef INTEL_EXECLISTS_READ_REG
+#undef INTEL_EXECLISTS_WRITE_REG
+
 static int execlists_update_context(struct drm_i915_gem_object *ctx_obj,
 				    struct drm_i915_gem_object *ring_obj,
 				    struct i915_hw_ppgtt *ppgtt,
@@ -387,44 +546,93 @@ static void execlists_submit_contexts(struct intel_engine_cs *ring,
 	execlists_elsp_write(ring, ctx_obj0, ctx_obj1);
 }
 
-static void execlists_context_unqueue(struct intel_engine_cs *ring)
+static void execlists_fetch_requests(struct intel_engine_cs *ring,
+			struct drm_i915_gem_request **req0,
+			struct drm_i915_gem_request **req1)
 {
-	struct drm_i915_gem_request *req0 = NULL, *req1 = NULL;
 	struct drm_i915_gem_request *cursor = NULL, *tmp = NULL;
 
-	assert_spin_locked(&ring->execlist_lock);
-
-	if (list_empty(&ring->execlist_queue))
+	if (!req0)
 		return;
+
+	*req0 = NULL;
+
+	if (req1)
+		*req1 = NULL;
 
 	/* Try to read in pairs */
 	list_for_each_entry_safe(cursor, tmp, &ring->execlist_queue,
 				 execlist_link) {
-		if (!req0) {
-			req0 = cursor;
-		} else if (req0->ctx == cursor->ctx) {
-			/* Same ctx: ignore first request, as second request
-			 * will update tail past first request's workload */
-			cursor->elsp_submitted = req0->elsp_submitted;
-			list_del(&req0->execlist_link);
-			list_add_tail(&req0->execlist_link,
+		if (!(*req0))
+			*req0 = cursor;
+		else if ((*req0)->ctx == cursor->ctx) {
+			/*
+			 * Same ctx: ignore first request, as second request
+			 * will update tail past first request's workload
+			 */
+			cursor->elsp_submitted = (*req0)->elsp_submitted;
+			list_del(&(*req0)->execlist_link);
+			list_add_tail(&(*req0)->execlist_link,
 				&ring->execlist_retired_req_list);
-			req0 = cursor;
+			*req0 = cursor;
 		} else {
-			req1 = cursor;
+			if (req1)
+				*req1 = cursor;
 			break;
 		}
 	}
+}
 
-	WARN_ON(req1 && req1->elsp_submitted);
+static void execlists_context_unqueue(struct intel_engine_cs *ring, bool tdr_resubmission)
+{
+	struct drm_i915_gem_request *req0 = NULL, *req1 = NULL;
+
+	assert_spin_locked(&ring->execlist_lock);
+	if (list_empty(&ring->execlist_queue))
+		return;
+
+	execlists_fetch_requests(ring, &req0, &req1);
+
+	if (tdr_resubmission && req1 && !req1->elsp_submitted)
+		req1 = NULL;
+
+	WARN_ON(req1 && req1->elsp_submitted && !tdr_resubmission);
 
 	execlists_submit_contexts(ring, req0->ctx, req0->tail,
 				  req1 ? req1->ctx : NULL,
 				  req1 ? req1->tail : 0);
 
-	req0->elsp_submitted++;
-	if (req1)
-		req1->elsp_submitted++;
+	if (!tdr_resubmission) {
+		req0->elsp_submitted++;
+		if (req1)
+			req1->elsp_submitted++;
+	}
+}
+
+/**
+ * intel_execlists_TDR_context_resubmission() - ELSP context resubmission
+ * bypassing queue.
+ *
+ * Context submission mechanism exclusively used by TDR that bypasses the
+ * execlist queue. This is necessary since at the point of TDR hang recovery
+ * the hardware will be hung and resubmitting a fixed context (the context that
+ * the TDR has identified as hung and fixed up in order to move past the
+ * blocking batch buffer) to a hung execlist queue will lock up the TDR.
+ * Instead, opt for direct ELSP submission without depending on the rest of the
+ * driver.
+ *
+ * @ring: engine to do resubmission for.
+ *
+ */
+void intel_execlists_TDR_context_resubmission(struct intel_engine_cs *ring)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ring->execlist_lock, flags);
+	WARN_ON(list_empty(&ring->execlist_queue));
+
+	execlists_context_unqueue(ring, true);
+	spin_unlock_irqrestore(&ring->execlist_lock, flags);
 }
 
 static bool execlists_check_remove_request(struct intel_engine_cs *ring,
@@ -506,7 +714,7 @@ void intel_lrc_irq_handler(struct intel_engine_cs *ring)
 	}
 
 	if (submit_contexts != 0)
-		execlists_context_unqueue(ring);
+		execlists_context_unqueue(ring, false);
 
 	spin_unlock(&ring->execlist_lock);
 
@@ -570,7 +778,7 @@ static int execlists_context_queue(struct intel_engine_cs *ring,
 
 	list_add_tail(&request->execlist_link, &ring->execlist_queue);
 	if (num_elements == 0)
-		execlists_context_unqueue(ring);
+		execlists_context_unqueue(ring, false);
 
 	spin_unlock_irq(&ring->execlist_lock);
 
@@ -1066,7 +1274,7 @@ static int gen8_init_common_ring(struct intel_engine_cs *ring)
 	ring->next_context_status_buffer = 0;
 	DRM_DEBUG_DRIVER("Execlists enabled for %s\n", ring->name);
 
-	memset(&ring->hangcheck, 0, sizeof(ring->hangcheck));
+	i915_hangcheck_reinit(ring);
 
 	return 0;
 }
@@ -1314,6 +1522,173 @@ out:
 	return ret;
 }
 
+static int
+gen8_ring_disable(struct intel_engine_cs *ring)
+{
+	intel_request_gpu_engine_reset(ring);
+	return 0;
+}
+
+static int
+gen8_ring_enable(struct intel_engine_cs *ring)
+{
+	intel_unrequest_gpu_engine_reset(ring);
+	return 0;
+}
+
+/*
+ * gen8_ring_save()
+ *
+ * Saves the head MMIO register to scratch memory while engine is reset and
+ * reinitialized. Before saving the head register we nudge the head position to
+ * be correctly aligned with a QWORD boundary, which brings it up to the next
+ * presumably valid instruction. Typically, at the point of hang recovery the
+ * head register will be pointing to the last DWORD of the BB_START
+ * instruction, which is followed by a padding MI_NOOP inserted by the
+ * driver.
+ *
+ * ring: engine to be reset
+ * req: request containing the context currently running on engine
+ * force_advance: indicates whether or not we should nudge the head
+ *		  forward or not
+ */
+static int
+gen8_ring_save(struct intel_engine_cs *ring, struct drm_i915_gem_request *req,
+		bool force_advance)
+{
+	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+	struct intel_ringbuffer *ringbuf = NULL;
+	struct intel_context *ctx;
+	int ret = 0;
+	int clamp_to_tail = 0;
+	uint32_t head;
+	uint32_t tail;
+	uint32_t head_addr;
+	uint32_t tail_addr;
+
+	if (WARN_ON(!req))
+	    return -EINVAL;
+
+	ctx = req->ctx;
+	ringbuf = ctx->engine[ring->id].ringbuf;
+
+	/*
+	 * Read head from MMIO register since it contains the
+	 * most up to date value of head at this point.
+	 */
+	head = I915_READ_HEAD(ring);
+
+	/*
+	 * Read tail from the context because the execlist queue
+	 * updates the tail value there first during submission.
+	 * The MMIO tail register is not updated until the actual
+	 * ring submission completes.
+	 */
+	ret = I915_READ_TAIL_CTX(ring, ctx, tail);
+	if (ret)
+		return ret;
+
+	/*
+	 * head_addr and tail_addr are the head and tail values
+	 * excluding ring wrapping information and aligned to DWORD
+	 * boundary
+	 */
+	head_addr = head & HEAD_ADDR;
+	tail_addr = tail & TAIL_ADDR;
+
+	/*
+	 * The head must always chase the tail.
+	 * If the tail is beyond the head then do not allow
+	 * the head to overtake it. If the tail is less than
+	 * the head then the tail has already wrapped and
+	 * there is no problem in advancing the head or even
+	 * wrapping the head back to 0 as worst case it will
+	 * become equal to tail
+	 */
+	if (head_addr <= tail_addr)
+		clamp_to_tail = 1;
+
+	if (force_advance) {
+
+		/* Force head pointer to next QWORD boundary */
+		head_addr &= ~0x7;
+		head_addr += 8;
+
+	} else if (head & 0x7) {
+
+		/* Ensure head pointer is pointing to a QWORD boundary */
+		head += 0x7;
+		head &= ~0x7;
+		head_addr = head;
+	}
+
+	if (clamp_to_tail && (head_addr > tail_addr)) {
+		head_addr = tail_addr;
+	} else if (head_addr >= ringbuf->size) {
+		/* Wrap head back to start if it exceeds ring size */
+		head_addr = 0;
+	}
+
+	head &= ~HEAD_ADDR;
+	head |= (head_addr & HEAD_ADDR);
+	ring->saved_head = head;
+
+	return 0;
+}
+
+static int
+gen8_ring_restore(struct intel_engine_cs *ring, struct drm_i915_gem_request *req)
+{
+	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+	struct intel_context *ctx;
+
+	if (WARN_ON(!req))
+	    return -EINVAL;
+
+	ctx = req->ctx;
+
+	/* Re-initialize ring */
+	if (ring->init_hw) {
+		int ret = ring->init_hw(ring);
+		if (ret != 0) {
+			DRM_ERROR("Failed to re-initialize %s\n",
+					ring->name);
+			return ret;
+		}
+	} else {
+		DRM_ERROR("ring init function pointer not set up\n");
+		return -EINVAL;
+	}
+
+	if (ring->id == RCS) {
+		/*
+		 * These register reinitializations are only located here
+		 * temporarily until they are moved out of the
+		 * init_clock_gating function to some function we can
+		 * call from here.
+		 */
+
+		/* WaVSRefCountFullforceMissDisable:chv */
+		/* WaDSRefCountFullforceMissDisable:chv */
+		I915_WRITE(GEN7_FF_THREAD_MODE,
+			   I915_READ(GEN7_FF_THREAD_MODE) &
+			   ~(GEN8_FF_DS_REF_CNT_FFME | GEN7_FF_VS_REF_CNT_FFME));
+
+		I915_WRITE(_3D_CHICKEN3,
+			   _3D_CHICKEN_SDE_LIMIT_FIFO_POLY_DEPTH(2));
+
+		/* WaSwitchSolVfFArbitrationPriority:bdw */
+		I915_WRITE(GAM_ECOCHK, I915_READ(GAM_ECOCHK) | HSW_ECOCHK_ARB_PRIO_SOL);
+	}
+
+	/* Restore head */
+
+	I915_WRITE_HEAD(ring, ring->saved_head);
+	I915_WRITE_HEAD_CTX(ring, ctx, ring->saved_head);
+
+	return 0;
+}
+
 static int gen8_init_rcs_context(struct intel_engine_cs *ring,
 		       struct intel_context *ctx)
 {
@@ -1412,6 +1787,10 @@ static int logical_render_ring_init(struct drm_device *dev)
 	ring->irq_get = gen8_logical_ring_get_irq;
 	ring->irq_put = gen8_logical_ring_put_irq;
 	ring->emit_bb_start = gen8_emit_bb_start;
+	ring->enable = gen8_ring_enable;
+	ring->disable = gen8_ring_disable;
+	ring->save = gen8_ring_save;
+	ring->restore = gen8_ring_restore;
 
 	ring->dev = dev;
 	ret = logical_ring_init(dev, ring);
@@ -1442,6 +1821,10 @@ static int logical_bsd_ring_init(struct drm_device *dev)
 	ring->irq_get = gen8_logical_ring_get_irq;
 	ring->irq_put = gen8_logical_ring_put_irq;
 	ring->emit_bb_start = gen8_emit_bb_start;
+	ring->enable = gen8_ring_enable;
+	ring->disable = gen8_ring_disable;
+	ring->save = gen8_ring_save;
+	ring->restore = gen8_ring_restore;
 
 	return logical_ring_init(dev, ring);
 }
@@ -1467,6 +1850,10 @@ static int logical_bsd2_ring_init(struct drm_device *dev)
 	ring->irq_get = gen8_logical_ring_get_irq;
 	ring->irq_put = gen8_logical_ring_put_irq;
 	ring->emit_bb_start = gen8_emit_bb_start;
+	ring->enable = gen8_ring_enable;
+	ring->disable = gen8_ring_disable;
+	ring->save = gen8_ring_save;
+	ring->restore = gen8_ring_restore;
 
 	return logical_ring_init(dev, ring);
 }
@@ -1492,6 +1879,10 @@ static int logical_blt_ring_init(struct drm_device *dev)
 	ring->irq_get = gen8_logical_ring_get_irq;
 	ring->irq_put = gen8_logical_ring_put_irq;
 	ring->emit_bb_start = gen8_emit_bb_start;
+	ring->enable = gen8_ring_enable;
+	ring->disable = gen8_ring_disable;
+	ring->save = gen8_ring_save;
+	ring->restore = gen8_ring_restore;
 
 	return logical_ring_init(dev, ring);
 }
@@ -1517,6 +1908,10 @@ static int logical_vebox_ring_init(struct drm_device *dev)
 	ring->irq_get = gen8_logical_ring_get_irq;
 	ring->irq_put = gen8_logical_ring_put_irq;
 	ring->emit_bb_start = gen8_emit_bb_start;
+	ring->enable = gen8_ring_enable;
+	ring->disable = gen8_ring_disable;
+	ring->save = gen8_ring_save;
+	ring->restore = gen8_ring_restore;
 
 	return logical_ring_init(dev, ring);
 }
@@ -1973,4 +2368,121 @@ void intel_lr_context_reset(struct drm_device *dev,
 		ringbuf->head = 0;
 		ringbuf->tail = 0;
 	}
+}
+
+/**
+ * intel_execlists_TDR_get_current_request() - return request currently
+ * processed by engine
+ *
+ * @ring: Engine currently running context to be returned.
+ *
+ * @req:  Output parameter containing the current request (the request at the
+ *	  head of execlist queue corresponding to the given ring). May be NULL
+ *	  if no request has been submitted to the execlist queue of this
+ *	  engine. If the req parameter passed in to the function is not NULL
+ *	  and a request is found and returned the request is referenced before
+ *	  it is returned. It is the responsibility of the caller to dereference
+ *	  it at the end of its life cycle.
+ *
+ * Return:
+ *	CONTEXT_SUBMISSION_STATUS_OK if request is found to be submitted and its
+ *	context is currently running on engine.
+ *
+ *	CONTEXT_SUBMISSION_STATUS_INCONSISTENT if request is found to be submitted
+ *	but its context is not in a state that is consistent with current
+ *	hardware state for the given engine. This has been observed in three cases:
+ *
+ *		1. Before the engine has switched to this context after it has
+ *		been submitted to the execlist queue.
+ *
+ *		2. After the engine has switched away from this context but
+ *		before the context has been removed from the execlist queue.
+ *
+ *		3. The driver has lost an interrupt. Typically the hardware has
+ *		gone to idle but the driver still thinks the context belonging to
+ *		the request at the head of the queue is still executing.
+ *
+ *	CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED if no context has been found
+ *	to be submitted to the execlist queue and if the hardware is idle.
+ */
+enum context_submission_status
+intel_execlists_TDR_get_current_request(struct intel_engine_cs *ring,
+		struct drm_i915_gem_request **req)
+{
+	struct drm_i915_private *dev_priv;
+	unsigned long flags;
+	struct drm_i915_gem_request *tmpreq = NULL;
+	struct intel_context *tmpctx = NULL;
+	unsigned hw_context = 0;
+	bool hw_active = false;
+	enum context_submission_status status =
+			CONTEXT_SUBMISSION_STATUS_UNDEFINED;
+
+	if (WARN_ON(!ring))
+		return status;
+
+	dev_priv = ring->dev->dev_private;
+
+	intel_uncore_forcewake_get(dev_priv, FORCEWAKE_ALL);
+	spin_lock_irqsave(&ring->execlist_lock, flags);
+	hw_context = I915_READ(RING_EXECLIST_STATUS_CTX_ID(ring));
+
+	hw_active = (I915_READ(RING_EXECLIST_STATUS(ring)) &
+		EXECLIST_STATUS_CURRENT_ACTIVE_ELEMENT_STATUS) ? true : false;
+
+	tmpreq = list_first_entry_or_null(&ring->execlist_queue,
+		struct drm_i915_gem_request, execlist_link);
+
+	if (tmpreq) {
+		/*
+		 * If the caller has not passed a non-NULL req parameter then
+		 * it is not interested in getting a request reference back.
+		 * Don't temporarily grab a reference since holding the execlist
+		 * lock is enough to ensure that the execlist code will hold its
+		 * reference all throughout this function. As long as that reference
+		 * is kept there is no need for us to take yet another reference.
+		 * The reason why this is of interest is because certain callers, such
+		 * as the TDR hang checker, cannot grab struct_mutex before calling
+		 * and because of that we cannot dereference any requests (DRM might
+		 * assert if we do). Just rely on the execlist code to provide
+		 * indirect protection.
+		 */
+		if (req)
+			i915_gem_request_reference(tmpreq);
+
+
+		if (tmpreq->ctx)
+			tmpctx = tmpreq->ctx;
+
+		WARN(!tmpctx, "No context in request %p\n", tmpreq);
+	}
+
+	if (tmpctx) {
+		unsigned sw_context =
+			intel_execlists_ctx_id((tmpctx)->engine[ring->id].state);
+
+		status = ((hw_context == sw_context) && hw_active) ?
+				CONTEXT_SUBMISSION_STATUS_OK :
+				CONTEXT_SUBMISSION_STATUS_INCONSISTENT;
+	} else {
+		/*
+		 * If we don't have any queue entries and the
+		 * EXECLIST_STATUS register points to zero we are
+		 * clearly not processing any context right now
+		 */
+		WARN((hw_context || hw_active), "hw_context=%x, hardware %s!\n",
+			hw_context, hw_active ? "not idle":"idle");
+
+		status = (hw_context || hw_active) ?
+			CONTEXT_SUBMISSION_STATUS_INCONSISTENT :
+			CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED;
+	}
+
+	if (req)
+		*req = tmpreq;
+
+	spin_unlock_irqrestore(&ring->execlist_lock, flags);
+	intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
+
+	return status;
 }

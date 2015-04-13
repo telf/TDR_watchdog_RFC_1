@@ -29,6 +29,8 @@
 /* Execlists regs */
 #define RING_ELSP(ring)			((ring)->mmio_base+0x230)
 #define RING_EXECLIST_STATUS(ring)	((ring)->mmio_base+0x234)
+#define	  EXECLIST_STATUS_CURRENT_ACTIVE_ELEMENT_STATUS	(0x3 << 14)
+#define RING_EXECLIST_STATUS_CTX_ID(ring)	(RING_EXECLIST_STATUS(ring)+4)
 #define RING_CONTEXT_CONTROL(ring)	((ring)->mmio_base+0x244)
 #define	  CTX_CTRL_INHIBIT_SYN_CTX_SWITCH	(1 << 3)
 #define	  CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT	(1 << 0)
@@ -88,5 +90,17 @@ u32 intel_execlists_ctx_id(struct drm_i915_gem_object *ctx_obj);
 
 void intel_lrc_irq_handler(struct intel_engine_cs *ring);
 void intel_execlists_retire_requests(struct intel_engine_cs *ring);
+
+int intel_execlists_read_tail(struct intel_engine_cs *ring,
+			 struct intel_context *ctx,
+			 u32 *tail);
+
+int intel_execlists_write_head(struct intel_engine_cs *ring,
+			  struct intel_context *ctx,
+			  u32 head);
+
+int intel_execlists_read_head(struct intel_engine_cs *ring,
+			 struct intel_context *ctx,
+			 u32 *head);
 
 #endif /* _INTEL_LRC_H_ */

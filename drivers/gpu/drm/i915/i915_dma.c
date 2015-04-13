@@ -776,6 +776,22 @@ static void intel_device_info_runtime_init(struct drm_device *dev)
 			 info->has_eu_pg ? "y" : "n");
 }
 
+static void
+i915_hangcheck_init(struct drm_device *dev)
+{
+	int i;
+	struct drm_i915_private *dev_priv = dev->dev_private;
+
+	for (i = 0; i < I915_NUM_RINGS; i++) {
+		struct intel_engine_cs *engine = &dev_priv->ring[i];
+		struct intel_ring_hangcheck *hc = &engine->hangcheck;
+
+		i915_hangcheck_reinit(engine);
+		hc->reset_count = 0;
+		hc->tdr_count = 0;
+	}
+}
+
 /**
  * i915_driver_load - setup chip and create an initial config
  * @dev: DRM device
@@ -955,6 +971,8 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
 	intel_setup_bios(dev);
 
 	i915_gem_load(dev);
+
+	i915_hangcheck_init(dev);
 
 	/* On the 945G/GM, the chipset reports the MSI capability on the
 	 * integrated graphics even though the support isn't actually there

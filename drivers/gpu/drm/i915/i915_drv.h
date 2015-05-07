@@ -2807,7 +2807,8 @@ i915_gem_find_active_request(struct intel_engine_cs *ring);
 
 bool i915_gem_retire_requests(struct drm_device *dev);
 void i915_gem_retire_requests_ring(struct intel_engine_cs *ring);
-int __must_check i915_gem_check_wedge(struct i915_gpu_error *error,
+int __must_check i915_gem_check_wedge(struct drm_i915_private *dev_priv,
+				      struct intel_engine_cs *engine,
 				      bool interruptible);
 int __must_check i915_gem_check_olr(struct drm_i915_gem_request *req);
 

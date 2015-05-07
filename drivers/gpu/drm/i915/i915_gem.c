@@ -97,12 +97,38 @@ static void i915_gem_info_remove_obj(struct drm_i915_private *dev_priv,
 	spin_unlock(&dev_priv->mm.object_stat_lock);
 }
 
+static inline int
+i915_engine_reset_in_progress(struct drm_i915_private *dev_priv,
+	struct intel_engine_cs *engine)
+{
+	int ret = 0;
+
+	if (engine) {
+		ret = !!(atomic_read(&dev_priv->ring[engine->id].hangcheck.flags)
+			& I915_ENGINE_RESET_IN_PROGRESS);
+	} else {
+		int i;
+
+		for (i = 0; i < I915_NUM_RINGS; i++)
+			if (atomic_read(&dev_priv->ring[i].hangcheck.flags)
+				& I915_ENGINE_RESET_IN_PROGRESS) {
+
+				ret = 1;
+				break;
+			}
+	}
+
+	return ret;
+}
+
 static int
-i915_gem_wait_for_error(struct i915_gpu_error *error)
+i915_gem_wait_for_error(struct drm_i915_private *dev_priv)
 {
 	int ret;
+	struct i915_gpu_error *error = &dev_priv->gpu_error;
 
 #define EXIT_COND (!i915_reset_in_progress(error) || \
+		   !i915_engine_reset_in_progress(dev_priv, NULL) || \
 		   i915_terminally_wedged(error))
 	if (EXIT_COND)
 		return 0;
@@ -131,7 +157,7 @@ int i915_mutex_lock_interruptible(struct drm_device *dev)
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	int ret;
 
-	ret = i915_gem_wait_for_error(&dev_priv->gpu_error);
+	ret = i915_gem_wait_for_error(dev_priv);
 	if (ret)
 		return ret;
 
@@ -1128,10 +1154,15 @@ put_rpm:
 }
 
 int
-i915_gem_check_wedge(struct i915_gpu_error *error,
+i915_gem_check_wedge(struct drm_i915_private *dev_priv,
+		     struct intel_engine_cs *engine,
 		     bool interruptible)
 {
-	if (i915_reset_in_progress(error)) {
+	struct i915_gpu_error *error = &dev_priv->gpu_error;
+
+	if (i915_reset_in_progress(error) ||
+	    i915_engine_reset_in_progress(dev_priv, engine)) {
+
 		/* Non-interruptible callers can't handle -EAGAIN, hence return
 		 * -EIO unconditionally for these. */
 		if (!interruptible)
@@ -1213,6 +1244,7 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 	unsigned long timeout_expire;
 	s64 before, now;
 	int ret;
+	int reset_in_progress = 0;
 
 	WARN(!intel_irqs_enabled(dev_priv), "IRQs disabled");
 
@@ -1239,11 +1271,17 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 
 		/* We need to check whether any gpu reset happened in between
 		 * the caller grabbing the seqno and now ... */
-		if (reset_counter != atomic_read(&dev_priv->gpu_error.reset_counter)) {
+		reset_in_progress =
+			i915_gem_check_wedge(ring->dev->dev_private, NULL, interruptible);
+
+		if ((reset_counter != atomic_read(&dev_priv->gpu_error.reset_counter)) ||
+		     reset_in_progress) {
+
 			/* ... but upgrade the -EAGAIN to an -EIO if the gpu
 			 * is truely gone. */
-			ret = i915_gem_check_wedge(&dev_priv->gpu_error, interruptible);
-			if (ret == 0)
+			if (reset_in_progress)
+				ret = reset_in_progress;
+			else
 				ret = -EAGAIN;
 			break;
 		}
@@ -1327,7 +1365,7 @@ i915_wait_request(struct drm_i915_gem_request *req)
 
 	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
 
-	ret = i915_gem_check_wedge(&dev_priv->gpu_error, interruptible);
+	ret = i915_gem_check_wedge(dev_priv, NULL, interruptible);
 	if (ret)
 		return ret;
 
@@ -1396,6 +1434,7 @@ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	unsigned reset_counter;
 	int ret;
+	struct intel_engine_cs *ring = NULL;
 
 	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
 	BUG_ON(!dev_priv->mm.interruptible);
@@ -1404,7 +1443,9 @@ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
 	if (!req)
 		return 0;
 
-	ret = i915_gem_check_wedge(&dev_priv->gpu_error, true);
+	ring = i915_gem_request_get_ring(req);
+
+	ret = i915_gem_check_wedge(dev_priv, ring, true);
 	if (ret)
 		return ret;
 
@@ -4089,11 +4130,7 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
 	unsigned reset_counter;
 	int ret;
 
-	ret = i915_gem_wait_for_error(&dev_priv->gpu_error);
-	if (ret)
-		return ret;
-
-	ret = i915_gem_check_wedge(&dev_priv->gpu_error, false);
+	ret = i915_gem_wait_for_error(dev_priv);
 	if (ret)
 		return ret;
 
@@ -4112,9 +4149,17 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
 	if (target == NULL)
 		return 0;
 
-	ret = __i915_wait_request(target, reset_counter, true, NULL, NULL);
-	if (ret == 0)
-		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work, 0);
+	if (target->ring) {
+		if (i915_gem_check_wedge(dev_priv, NULL, false))
+			return -EIO;
+
+		ret = __i915_wait_request(target, reset_counter, true, NULL,
+			NULL);
+
+		if (ret == 0)
+			queue_delayed_work(dev_priv->wq,
+				&dev_priv->mm.retire_work, 0);
+	}
 
 	i915_gem_request_unreference__unlocked(target);
 

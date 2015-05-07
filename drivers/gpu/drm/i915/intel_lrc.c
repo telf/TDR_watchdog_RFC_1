@@ -986,7 +986,8 @@ static int intel_logical_ring_begin(struct intel_ringbuffer *ringbuf,
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	int ret;
 
-	ret = i915_gem_check_wedge(&dev_priv->gpu_error,
+	ret = i915_gem_check_wedge(dev_priv,
+				   ring,
 				   dev_priv->mm.interruptible);
 	if (ret)
 		return ret;

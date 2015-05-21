@@ -10356,9 +10356,21 @@ static void intel_mmio_flip_work_func(struct work_struct *work)
 
 	mmio_flip = &crtc->mmio_flip;
 	if (mmio_flip->req)
-		WARN_ON(__i915_wait_request(mmio_flip->req,
+	{
+		int ret = __i915_wait_request(mmio_flip->req,
 					    crtc->reset_counter,
-					    false, NULL, NULL) != 0);
+					    false, NULL, NULL);
+
+		/*
+		 * If a hang has been detected then we expect
+		 * __i915_wait_request to fail since it's probably going to be
+		 * forced to give up the struct_mutex and try to grab it again
+		 * once the TDR is done. Don't produce a warning in that case!
+		 */
+		if (ret)
+			WARN_ON(!i915_gem_check_wedge(crtc->base.dev->dev_private,
+					NULL, true));
+	}
 
 	intel_do_mmio_flip(crtc);
 	if (mmio_flip->req) {

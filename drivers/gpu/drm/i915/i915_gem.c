@@ -2676,6 +2676,20 @@ void i915_gem_reset(struct drm_device *dev)
 	i915_gem_restore_fences(dev);
 }
 
+void i915_gem_reset_engine(struct drm_i915_private *dev_priv,
+			   struct intel_engine_cs *engine)
+{
+	u32 completed_seqno;
+	struct drm_i915_gem_request *req;
+
+	completed_seqno = engine->get_seqno(engine, false);
+
+	/* Find pending batch buffers and mark them as such  */
+	list_for_each_entry(req, &engine->request_list, list)
+	        if (req && (req->seqno > completed_seqno))
+	                i915_set_reset_status(dev_priv, req->ctx, false);
+}
+
 /**
  * This function clears the request list as sequence numbers are passed.
  */

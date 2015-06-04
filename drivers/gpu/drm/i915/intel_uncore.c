@@ -1449,18 +1449,33 @@ static int gen6_do_reset(struct drm_device *dev)
 
 int intel_gpu_reset(struct drm_device *dev)
 {
-	if (INTEL_INFO(dev)->gen >= 6)
-		return gen6_do_reset(dev);
+	int ret = -ENODEV;
+	int gen = INTEL_INFO(dev)->gen;
+
+	if (gen >= 6)
+		ret = gen6_do_reset(dev);
 	else if (IS_GEN5(dev))
-		return ironlake_do_reset(dev);
+		ret = ironlake_do_reset(dev);
 	else if (IS_G4X(dev))
-		return g4x_do_reset(dev);
+		ret = g4x_do_reset(dev);
 	else if (IS_G33(dev))
-		return g33_do_reset(dev);
+		ret = g33_do_reset(dev);
 	else if (INTEL_INFO(dev)->gen >= 3)
-		return i915_do_reset(dev);
+		ret = i915_do_reset(dev);
 	else
-		return -ENODEV;
+		WARN(1, "Full GPU reset not supported on gen %d\n", gen);
+
+	if (!ret) {
+		char *reset_event[2];
+
+		reset_event[1] = NULL;
+		reset_event[0] = kasprintf(GFP_KERNEL, "%s", "GPU RESET=0");
+		kobject_uevent_env(&dev->primary->kdev->kobj,
+				KOBJ_CHANGE, reset_event);
+		kfree(reset_event[0]);
+	}
+
+	return ret;
 }
 
 void intel_uncore_check_errors(struct drm_device *dev)

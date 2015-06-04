@@ -30,6 +30,8 @@ struct  intel_hw_status_page {
 	struct		drm_i915_gem_object *obj;
 };
 
+#define I915_WATCHDOG_ENABLE 0
+
 #define I915_READ_TAIL(ring) I915_READ(RING_TAIL((ring)->mmio_base))
 #define I915_WRITE_TAIL(ring, val) I915_WRITE(RING_TAIL((ring)->mmio_base), val)
 
@@ -136,6 +138,9 @@ struct intel_ring_hangcheck {
 
 	/* Number of TDR hang detections */
 	u32 tdr_count;
+
+	/* Number of watchdog hang detections for this ring */
+	u32 watchdog_count;
 };
 
 struct intel_ringbuffer {
@@ -338,6 +343,12 @@ struct  intel_engine_cs {
 	/* Saved head value to be restored after reset */
 	u32 saved_head;
 
+	/*
+	 * Watchdog timer threshold values
+	 * only RCS, VCS, VCS2 rings have watchdog timeout support
+	 */
+	uint32_t watchdog_threshold;
+
 	struct {
 		struct drm_i915_gem_object *obj;
 		u32 gtt_offset;
@@ -483,6 +494,26 @@ int intel_ring_save(struct intel_engine_cs *ring,
 		struct drm_i915_gem_request *req, bool force_advance);
 int intel_ring_restore(struct intel_engine_cs *ring,
 		struct drm_i915_gem_request *req);
+
+static inline bool intel_ring_supports_watchdog(struct intel_engine_cs *ring)
+{
+	bool ret = false;
+
+	if (WARN_ON(!ring))
+		goto exit;
+
+	ret = (	ring->id == RCS ||
+		ring->id == VCS ||
+		ring->id == VCS2);
+
+	if (!ret)
+		DRM_ERROR("%s does not support watchdog timeout!\n", ring->name);
+
+exit:
+	return ret;
+}
+int intel_ring_start_watchdog(struct intel_engine_cs *ring);
+int intel_ring_stop_watchdog(struct intel_engine_cs *ring);
 
 int __must_check intel_ring_idle(struct intel_engine_cs *ring);
 void intel_ring_init_seqno(struct intel_engine_cs *ring, u32 seqno);

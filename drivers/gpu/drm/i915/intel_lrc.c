@@ -1122,6 +1122,78 @@ static int intel_logical_ring_begin(struct intel_ringbuffer *ringbuf,
 	return 0;
 }
 
+static int
+gen8_ring_start_watchdog(struct intel_ringbuffer *ringbuf, struct intel_context *ctx)
+{
+	int ret;
+	struct intel_engine_cs *ring = ringbuf->ring;
+
+	ret = intel_logical_ring_begin(ringbuf, ctx, 10);
+	if (ret)
+		return ret;
+
+	/*
+	 * i915_reg.h includes a warning to place a MI_NOOP
+	 * before a MI_LOAD_REGISTER_IMM
+	 */
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+
+	/* Set counter period */
+	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
+	intel_logical_ring_emit(ringbuf, RING_THRESH(ring->mmio_base));
+	intel_logical_ring_emit(ringbuf, ring->watchdog_threshold);
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+
+	/* Start counter */
+	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
+	intel_logical_ring_emit(ringbuf, RING_CNTR(ring->mmio_base));
+	intel_logical_ring_emit(ringbuf, I915_WATCHDOG_ENABLE);
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+	intel_logical_ring_advance(ringbuf);
+
+	return 0;
+}
+
+static int
+gen8_ring_stop_watchdog(struct intel_ringbuffer *ringbuf, struct intel_context *ctx)
+{
+	int ret;
+	struct intel_engine_cs *ring = ringbuf->ring;
+
+	ret = intel_logical_ring_begin(ringbuf, ctx, 6);
+	if (ret)
+		return ret;
+
+	/*
+	 * i915_reg.h includes a warning to place a MI_NOOP
+	 * before a MI_LOAD_REGISTER_IMM
+	 */
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+
+	intel_logical_ring_emit(ringbuf, MI_LOAD_REGISTER_IMM(1));
+	intel_logical_ring_emit(ringbuf, RING_CNTR(ring->mmio_base));
+
+	switch (ring->id) {
+	default:
+		WARN(1, "%s does not support watchdog timeout! " \
+			"Defaulting to render engine.\n", ring->name);
+	case RCS:
+		intel_logical_ring_emit(ringbuf, GEN6_RCS_WATCHDOG_DISABLE);
+		break;
+	case VCS:
+	case VCS2:
+		intel_logical_ring_emit(ringbuf, GEN8_VCS_WATCHDOG_DISABLE);
+		break;
+	}
+
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+	intel_logical_ring_advance(ringbuf);
+
+	return 0;
+}
+
 /**
  * execlists_submission() - submit a batchbuffer for execution, Execlists style
  * @dev: DRM device.
@@ -1152,6 +1224,7 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
 	int instp_mode;
 	u32 instp_mask;
 	int ret;
+	bool watchdog_running = false;
 
 	instp_mode = args->flags & I915_EXEC_CONSTANTS_MASK;
 	instp_mask = I915_EXEC_CONSTANTS_MASK;
@@ -1203,6 +1276,18 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
 	if (ret)
 		return ret;
 
+	/* Start watchdog timer */
+	if (args->flags & I915_EXEC_ENABLE_WATCHDOG) {
+		if (!intel_ring_supports_watchdog(ring))
+			return -EINVAL;
+
+		ret = gen8_ring_start_watchdog(ringbuf, ctx);
+		if (ret)
+			return ret;
+
+		watchdog_running = true;
+	}
+
 	if (ring == &dev_priv->ring[RCS] &&
 	    instp_mode != dev_priv->relative_constants_mode) {
 		ret = intel_logical_ring_begin(ringbuf, ctx, 4);
@@ -1223,6 +1308,13 @@ int intel_execlists_submission(struct drm_device *dev, struct drm_file *file,
 		return ret;
 
 	trace_i915_gem_ring_dispatch(intel_ring_get_request(ring), dispatch_flags);
+
+	/* Cancel watchdog timer */
+	if (watchdog_running) {
+		ret = gen8_ring_stop_watchdog(ringbuf, ctx);
+		if (ret)
+			return ret;
+	}
 
 	i915_gem_execbuffer_move_to_active(vmas, ring);
 	i915_gem_execbuffer_retire_commands(dev, file, ring, batch_obj);
@@ -1892,6 +1984,9 @@ static int logical_render_ring_init(struct drm_device *dev)
 	if (HAS_L3_DPF(dev))
 		ring->irq_keep_mask |= GT_RENDER_L3_PARITY_ERROR_INTERRUPT;
 
+	ring->irq_keep_mask |=
+		(GT_GEN8_RCS_WATCHDOG_INTERRUPT << GEN8_RCS_IRQ_SHIFT);
+
 	if (INTEL_INFO(dev)->gen >= 9)
 		ring->init_hw = gen9_init_render_ring;
 	else
@@ -1930,6 +2025,8 @@ static int logical_bsd_ring_init(struct drm_device *dev)
 		GT_RENDER_USER_INTERRUPT << GEN8_VCS1_IRQ_SHIFT;
 	ring->irq_keep_mask =
 		GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS1_IRQ_SHIFT;
+	ring->irq_keep_mask |=
+		(GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS1_IRQ_SHIFT);
 
 	ring->init_hw = gen8_init_common_ring;
 	ring->get_seqno = gen8_get_seqno;
@@ -1959,6 +2056,8 @@ static int logical_bsd2_ring_init(struct drm_device *dev)
 		GT_RENDER_USER_INTERRUPT << GEN8_VCS2_IRQ_SHIFT;
 	ring->irq_keep_mask =
 		GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS2_IRQ_SHIFT;
+	ring->irq_keep_mask |=
+		(GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS2_IRQ_SHIFT);
 
 	ring->init_hw = gen8_init_common_ring;
 	ring->get_seqno = gen8_get_seqno;

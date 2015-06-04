@@ -760,7 +760,10 @@ struct drm_i915_gem_execbuffer2 {
 #define I915_EXEC_BSD_RING1		(1<<13)
 #define I915_EXEC_BSD_RING2		(2<<13)
 
-#define __I915_EXEC_UNKNOWN_FLAGS -(1<<15)
+/* Enable watchdog timer for this batch buffer */
+#define I915_EXEC_ENABLE_WATCHDOG       (1<<15)
+
+#define __I915_EXEC_UNKNOWN_FLAGS -(1<<16)
 
 #define I915_EXEC_CONTEXT_ID_MASK	(0xffffffff)
 #define i915_execbuffer2_set_context_id(eb2, context) \

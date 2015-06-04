@@ -2563,6 +2563,7 @@ extern unsigned long i915_gfx_val(struct drm_i915_private *dev_priv);
 extern void i915_update_gfx_val(struct drm_i915_private *dev_priv);
 int vlv_force_gfx_clock(struct drm_i915_private *dev_priv, bool on);
 void intel_hpd_cancel_work(struct drm_i915_private *dev_priv);
+void i915_watchdog_init(struct drm_device *dev);
 static inline void i915_hangcheck_reinit(struct intel_engine_cs *engine)
 {
 	struct intel_ring_hangcheck *hc = &engine->hangcheck;
@@ -2578,9 +2579,9 @@ static inline void i915_hangcheck_reinit(struct intel_engine_cs *engine)
 
 /* i915_irq.c */
 void i915_queue_hangcheck(struct drm_device *dev);
-__printf(4, 5)
-void i915_handle_error(struct drm_device *dev, u32 engine_mask, bool wedged,
-		       const char *fmt, ...);
+__printf(5, 6)
+void i915_handle_error(struct drm_device *dev, u32 engine_mask,
+		       bool watchdog, bool wedged, const char *fmt, ...);
 
 extern void intel_irq_init(struct drm_i915_private *dev_priv);
 extern void intel_hpd_init(struct drm_i915_private *dev_priv);

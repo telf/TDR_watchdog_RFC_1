@@ -792,6 +792,64 @@ i915_hangcheck_init(struct drm_device *dev)
 	}
 }
 
+void i915_watchdog_init(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	int freq;
+	int i;
+
+	/*
+	 * Based on pre-defined time out value (60ms or 30ms) calculate
+	 * timer count thresholds needed based on core frequency.
+	 *
+	 * For RCS.
+	 * The timestamp resolution changed in Gen7 and beyond to 80ns
+	 * for all pipes. Before that it was 640ns.
+	 */
+
+#define KM_RCS_ENGINE_TIMEOUT_VALUE_IN_MS 60
+#define KM_BSD_ENGINE_TIMEOUT_VALUE_IN_MS 60
+#define KM_TIMER_MILLISECOND 1000
+
+	/*
+	 * Timestamp timer resolution = 0.080 uSec,
+	 * or 12500000 counts per second
+	 */
+#define KM_TIMESTAMP_CNTS_PER_SEC_80NS 12500000
+
+	/*
+	 * Timestamp timer resolution = 0.640 uSec,
+	 * or 1562500 counts per second
+	 */
+#define KM_TIMESTAMP_CNTS_PER_SEC_640NS 1562500
+
+	if (INTEL_INFO(dev)->gen >= 7)
+		freq = KM_TIMESTAMP_CNTS_PER_SEC_80NS;
+	else
+		freq = KM_TIMESTAMP_CNTS_PER_SEC_640NS;
+
+	dev_priv->ring[RCS].watchdog_threshold =
+		((KM_RCS_ENGINE_TIMEOUT_VALUE_IN_MS) *
+		(freq / KM_TIMER_MILLISECOND));
+
+	dev_priv->ring[VCS].watchdog_threshold =
+		((KM_BSD_ENGINE_TIMEOUT_VALUE_IN_MS) *
+		(freq / KM_TIMER_MILLISECOND));
+
+	dev_priv->ring[VCS2].watchdog_threshold =
+		((KM_BSD_ENGINE_TIMEOUT_VALUE_IN_MS) *
+		(freq / KM_TIMER_MILLISECOND));
+
+	for (i = 0; i < I915_NUM_RINGS; i++)
+		dev_priv->ring[i].hangcheck.watchdog_count = 0;
+
+	DRM_INFO("Watchdog Timeout [ms], " \
+			"RCS: 0x%08X, VCS: 0x%08X, VCS2: 0x%08X\n", \
+			KM_RCS_ENGINE_TIMEOUT_VALUE_IN_MS,
+			KM_BSD_ENGINE_TIMEOUT_VALUE_IN_MS,
+			KM_BSD_ENGINE_TIMEOUT_VALUE_IN_MS);
+}
+
 /**
  * i915_driver_load - setup chip and create an initial config
  * @dev: DRM device
@@ -973,6 +1031,7 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
 	i915_gem_load(dev);
 
 	i915_hangcheck_init(dev);
+	i915_watchdog_init(dev);
 
 	/* On the 945G/GM, the chipset reports the MSI capability on the
 	 * integrated graphics even though the support isn't actually there

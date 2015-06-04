@@ -1289,6 +1289,18 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 				intel_lrc_irq_handler(&dev_priv->ring[RCS]);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_RCS_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[RCS]);
+			if (tmp & (GT_GEN8_RCS_WATCHDOG_INTERRUPT << GEN8_RCS_IRQ_SHIFT)) {
+				struct intel_engine_cs *ring;
+
+				/* Stop the counter to prevent further interrupts */
+				ring = &dev_priv->ring[RCS];
+				I915_WRITE(RING_CNTR(ring->mmio_base),
+					GEN6_RCS_WATCHDOG_DISABLE);
+
+				ring->hangcheck.watchdog_count++;
+				i915_handle_error(ring->dev, intel_ring_flag(ring), true, true,
+					"Render engine watchdog timed out");
+			}
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_BCS_IRQ_SHIFT))
 				intel_lrc_irq_handler(&dev_priv->ring[BCS]);
@@ -1308,11 +1320,35 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 				intel_lrc_irq_handler(&dev_priv->ring[VCS]);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VCS1_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[VCS]);
+			if (tmp & (GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS1_IRQ_SHIFT)) {
+				struct intel_engine_cs *ring;
+
+				/* Stop the counter to prevent further interrupts */
+				ring = &dev_priv->ring[VCS];
+				I915_WRITE(RING_CNTR(ring->mmio_base),
+					GEN8_VCS_WATCHDOG_DISABLE);
+
+				ring->hangcheck.watchdog_count++;
+				i915_handle_error(ring->dev, intel_ring_flag(ring), true, true,
+						  "Media engine watchdog timed out");
+			}
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS2_IRQ_SHIFT))
 				intel_lrc_irq_handler(&dev_priv->ring[VCS2]);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VCS2_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[VCS2]);
+			if (tmp & (GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS2_IRQ_SHIFT)) {
+				struct intel_engine_cs *ring;
+
+				/* Stop the counter to prevent further interrupts */
+				ring = &dev_priv->ring[VCS2];
+				I915_WRITE(RING_CNTR(ring->mmio_base),
+					GEN8_VCS_WATCHDOG_DISABLE);
+
+				ring->hangcheck.watchdog_count++;
+				i915_handle_error(ring->dev, intel_ring_flag(ring), true, true,
+						  "Media engine 2 watchdog timed out");
+			}
 		} else
 			DRM_ERROR("The master control interrupt lied (GT1)!\n");
 	}
@@ -2573,6 +2609,7 @@ static void i915_report_and_clear_eir(struct drm_device *dev)
  *			or if one of the current engine resets fails we fall
  *			back to legacy full GPU reset.
  *
+ * @watchdog: 		true = Engine hang detected by hardware watchdog.
  * @wedged: 		true = Hang detected, invoke hang recovery.
  * @fmt, ...: 		Error message describing reason for error.
  *
@@ -2584,8 +2621,8 @@ static void i915_report_and_clear_eir(struct drm_device *dev)
  * reset the associated engine. Failing that, try to fall back to legacy
  * full GPU reset recovery mode.
  */
-void i915_handle_error(struct drm_device *dev, u32 engine_mask, bool wedged,
-		       const char *fmt, ...)
+void i915_handle_error(struct drm_device *dev, u32 engine_mask,
+                       bool watchdog, bool wedged, const char *fmt, ...)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	va_list args;
@@ -2617,20 +2654,27 @@ void i915_handle_error(struct drm_device *dev, u32 engine_mask, bool wedged,
 			u32 i;
 
 			for_each_ring(engine, dev_priv, i) {
-				u32 now, last_engine_reset_timediff;
 
 				if (!(intel_ring_flag(engine) & engine_mask))
 					continue;
 
-				/* Measure the time since this engine was last reset */
-				now = get_seconds();
-				last_engine_reset_timediff =
-					now - engine->hangcheck.last_engine_reset_time;
+				if (!watchdog) {
+					/* Measure the time since this engine was last reset */
+					u32 now = get_seconds();
+					u32 last_engine_reset_timediff =
+						now - engine->hangcheck.last_engine_reset_time;
 
-				full_reset = last_engine_reset_timediff <
-					i915.gpu_reset_promotion_time;
+					full_reset = last_engine_reset_timediff <
+						i915.gpu_reset_promotion_time;
 
-				engine->hangcheck.last_engine_reset_time = now;
+					engine->hangcheck.last_engine_reset_time = now;
+				} else {
+					/*
+					 * Watchdog timeout always results
+					 * in engine reset.
+					 */
+					full_reset = false;
+				}
 
 				/*
 				 * This engine was not reset too recently - go ahead
@@ -2641,10 +2685,11 @@ void i915_handle_error(struct drm_device *dev, u32 engine_mask, bool wedged,
 				 * This can still be overridden by a global
 				 * reset e.g. if per-engine reset fails.
 				 */
-				if (!full_reset)
+				if (watchdog || !full_reset)
 					atomic_set_mask(I915_ENGINE_RESET_IN_PROGRESS,
 						&engine->hangcheck.flags);
-				else
+
+				if (full_reset)
 					break;
 
 			} /* for_each_ring */
@@ -2652,7 +2697,7 @@ void i915_handle_error(struct drm_device *dev, u32 engine_mask, bool wedged,
 
 		if (full_reset) {
 			atomic_set_mask(I915_RESET_IN_PROGRESS_FLAG,
-					&dev_priv->gpu_error.reset_counter);
+				&dev_priv->gpu_error.reset_counter);
 		}
 
 		/*
@@ -2990,7 +3035,7 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
 	 */
 	tmp = I915_READ_CTL(ring);
 	if (tmp & RING_WAIT) {
-		i915_handle_error(dev, intel_ring_flag(ring), false,
+		i915_handle_error(dev, intel_ring_flag(ring), false, false,
 				  "Kicking stuck wait on %s",
 				  ring->name);
 		I915_WRITE_CTL(ring, tmp);
@@ -3002,7 +3047,7 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
 		default:
 			return HANGCHECK_HUNG;
 		case 1:
-			i915_handle_error(dev, intel_ring_flag(ring), false,
+			i915_handle_error(dev, intel_ring_flag(ring), false, false,
 					  "Kicking stuck semaphore on %s",
 					  ring->name);
 			I915_WRITE_CTL(ring, tmp);
@@ -3135,7 +3180,7 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 	}
 
 	if (engine_mask)
-		i915_handle_error(dev, engine_mask, true, "Ring hung (0x%02x)", engine_mask);
+		i915_handle_error(dev, engine_mask, false, true, "Ring hung (0x%02x)", engine_mask);
 
 	if (busy_count)
 		/* Reset timer case chip hangs without another request
@@ -3589,11 +3634,14 @@ static void gen8_gt_irq_postinstall(struct drm_i915_private *dev_priv)
 {
 	/* These are interrupts we'll toggle with the ring mask register */
 	uint32_t gt_interrupts[] = {
+		GT_GEN8_RCS_WATCHDOG_INTERRUPT << GEN8_RCS_IRQ_SHIFT |
 		GT_RENDER_USER_INTERRUPT << GEN8_RCS_IRQ_SHIFT |
 			GT_CONTEXT_SWITCH_INTERRUPT << GEN8_RCS_IRQ_SHIFT |
 			GT_RENDER_L3_PARITY_ERROR_INTERRUPT |
 			GT_RENDER_USER_INTERRUPT << GEN8_BCS_IRQ_SHIFT |
 			GT_CONTEXT_SWITCH_INTERRUPT << GEN8_BCS_IRQ_SHIFT,
+		GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS1_IRQ_SHIFT |
+		GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS2_IRQ_SHIFT |
 		GT_RENDER_USER_INTERRUPT << GEN8_VCS1_IRQ_SHIFT |
 			GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS1_IRQ_SHIFT |
 			GT_RENDER_USER_INTERRUPT << GEN8_VCS2_IRQ_SHIFT |

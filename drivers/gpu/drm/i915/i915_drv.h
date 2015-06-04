@@ -2323,6 +2323,24 @@ enum context_submission_status {
 	CONTEXT_SUBMISSION_STATUS_UNDEFINED
 };
 
+static inline const char*
+i915_context_submission_status_to_str(enum context_submission_status status)
+{
+	switch(status)
+	{
+		case CONTEXT_SUBMISSION_STATUS_OK:
+			return "ok";
+		case CONTEXT_SUBMISSION_STATUS_INCONSISTENT:
+			return "inconsistent";
+		case CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED:
+			return "none";
+		case CONTEXT_SUBMISSION_STATUS_UNDEFINED:
+			return "undefined";
+		default:
+			return "invalid";
+	}
+}
+
 /* Note that the (struct drm_i915_private *) cast is just to shut up gcc. */
 #define __I915__(p) ({ \
 	struct drm_i915_private *__p; \
@@ -3129,6 +3147,7 @@ void i915_destroy_error_state(struct drm_device *dev);
 
 void i915_get_extra_instdone(struct drm_device *dev, uint32_t *instdone);
 const char *i915_cache_level_str(struct drm_i915_private *i915, int type);
+const char *hangcheck_action_to_str(enum intel_ring_hangcheck_action a);
 
 /* i915_cmd_parser.c */
 int i915_cmd_parser_get_version(void);

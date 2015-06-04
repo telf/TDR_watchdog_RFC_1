@@ -1442,6 +1442,8 @@ static int gen6_do_reset(struct drm_device *dev)
 	/* Spin waiting for the device to ack the reset request */
 	ret = wait_for((__raw_i915_read32(dev_priv, GEN6_GDRST) & GEN6_GRDOM_FULL) == 0, 500);
 
+	trace_i915_tdr_gpu_reset_complete(dev);
+
 	intel_uncore_forcewake_reset(dev, true);
 
 	return ret;
@@ -1534,6 +1536,8 @@ static int do_engine_reset_nolock(struct intel_engine_cs *engine)
 		DRM_ERROR("Unexpected engine: %d\n", engine->id);
 		break;
 	}
+
+	trace_i915_tdr_engine_reset_complete(engine);
 
 	return ret;
 }

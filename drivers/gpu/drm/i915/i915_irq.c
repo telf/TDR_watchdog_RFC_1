@@ -2359,6 +2359,7 @@ static void i915_error_work_func(struct work_struct *work)
 
 	mutex_lock(&dev->struct_mutex);
 
+	trace_i915_tdr_recovery_start(dev);
 	kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, error_event);
 
 	for_each_ring(ring, dev_priv, i) {
@@ -2488,6 +2489,8 @@ static void i915_error_work_func(struct work_struct *work)
 
 	kobject_uevent_env(&dev->primary->kdev->kobj,
 			   KOBJ_CHANGE, reset_done_event);
+
+	trace_i915_tdr_recovery_complete(dev);
 }
 
 static void i915_report_and_clear_eir(struct drm_device *dev)
@@ -2618,6 +2621,7 @@ void i915_handle_error(struct drm_device *dev, u32 engine_mask,
 	struct drm_i915_private *dev_priv = dev->dev_private;
 	va_list args;
 	char error_msg[80];
+	bool full_reset = true;
 
 	struct intel_engine_cs *engine;
 
@@ -2635,7 +2639,6 @@ void i915_handle_error(struct drm_device *dev, u32 engine_mask,
 		 *	2. The hardware does not support it (pre-gen7).
 		 *	3. We already tried per-engine reset recently.
 		 */
-		bool full_reset = true;
 
 		/*
 		 * TBD: We currently only support per-engine reset for gen8+.
@@ -2659,6 +2662,7 @@ void i915_handle_error(struct drm_device *dev, u32 engine_mask,
 						i915.gpu_reset_promotion_time;
 
 					engine->hangcheck.last_engine_reset_time = now;
+
 				} else {
 					/*
 					 * Watchdog timeout always results
@@ -2706,6 +2710,8 @@ void i915_handle_error(struct drm_device *dev, u32 engine_mask,
 		 */
 		i915_error_wake_up(dev_priv, false);
 	}
+
+	trace_i915_tdr_recovery_queued(dev, engine_mask, watchdog, full_reset);
 
 	/*
 	 * Gen 7:
@@ -3212,6 +3218,8 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 		ring->hangcheck.seqno = seqno;
 		ring->hangcheck.acthd = acthd;
 		busy_count += busy;
+
+		trace_i915_tdr_hang_check(ring, seqno, acthd, busy, status[i]);
 	}
 
 	for_each_ring(ring, dev_priv, i) {

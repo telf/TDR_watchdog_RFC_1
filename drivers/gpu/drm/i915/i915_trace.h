@@ -775,6 +775,304 @@ TRACE_EVENT(switch_mm,
 		  __entry->dev, __entry->ring, __entry->to, __entry->vm)
 );
 
+/**
+ * DOC: i915_tdr_gpu_recovery
+ *
+ * This tracepoint tracks the onset of the full GPU recovery path
+ */
+TRACE_EVENT(i915_tdr_gpu_recovery,
+	TP_PROTO(struct drm_device *dev),
+
+	TP_ARGS(dev),
+
+	TP_STRUCT__entry(
+			__field(u32, dev)
+	),
+
+	TP_fast_assign(
+			__entry->dev = dev->primary->index;
+	),
+
+	TP_printk("dev=%u, full GPU recovery started",
+		  __entry->dev)
+);
+
+/**
+ * DOC: i915_tdr_engine_recovery
+ *
+ * This tracepoint tracks the onset of the engine recovery path
+ */
+TRACE_EVENT(i915_tdr_engine_recovery,
+	TP_PROTO(struct intel_engine_cs *engine),
+
+	TP_ARGS(engine),
+
+	TP_STRUCT__entry(
+			__field(struct intel_engine_cs *, engine)
+	),
+
+	TP_fast_assign(
+			__entry->engine = engine;
+	),
+
+	TP_printk("dev=%u, engine=%u, recovery of %s started",
+		  __entry->engine->dev->primary->index,
+		  __entry->engine->id,
+		  __entry->engine->name)
+);
+
+/**
+ * DOC: i915_tdr_recovery_start
+ *
+ * This tracepoint tracks hang recovery start
+ */
+TRACE_EVENT(i915_tdr_recovery_start,
+	TP_PROTO(struct drm_device *dev),
+
+	TP_ARGS(dev),
+
+	TP_STRUCT__entry(
+			__field(u32, dev)
+	),
+
+	TP_fast_assign(
+			__entry->dev = dev->primary->index;
+	),
+
+	TP_printk("dev=%u, hang recovery started",
+		  __entry->dev)
+);
+
+/**
+ * DOC: i915_tdr_recovery_complete
+ *
+ * This tracepoint tracks hang recovery completion
+ */
+TRACE_EVENT(i915_tdr_recovery_complete,
+	TP_PROTO(struct drm_device *dev),
+
+	TP_ARGS(dev),
+
+	TP_STRUCT__entry(
+			__field(u32, dev)
+	),
+
+	TP_fast_assign(
+			__entry->dev = dev->primary->index;
+	),
+
+	TP_printk("dev=%u, hang recovery completed",
+		  __entry->dev)
+);
+
+/**
+ * DOC: i915_tdr_recovery_queued
+ *
+ * This tracepoint tracks the point of queuing recovery from hang check.
+ * If engine recovery is requested engine name will be displayed, otherwise
+ * it will be set to "none". If too many engine reset was attempted in the
+ * previous history we promote to full GPU reset, which is remarked by appending
+ * the "[PROMOTED]" flag.
+ */
+TRACE_EVENT(i915_tdr_recovery_queued,
+	TP_PROTO(struct drm_device *dev,
+		 u32 hung_engines,
+		 bool watchdog,
+		 bool full_reset),
+
+	TP_ARGS(dev, hung_engines, watchdog, full_reset),
+
+	TP_STRUCT__entry(
+			__field(u32, dev)
+			__field(u32, hung_engines)
+			__field(bool, watchdog)
+			__field(bool, full_reset)
+	),
+
+	TP_fast_assign(
+			__entry->dev = dev->primary->index;
+			__entry->hung_engines = hung_engines;
+			__entry->watchdog = watchdog;
+			__entry->full_reset = full_reset;
+	),
+
+	TP_printk("dev=%u, hung_engines=0x%02x%s%s%s%s%s%s%s, watchdog=%s, full_reset=%s",
+		  __entry->dev,
+		  __entry->hung_engines,
+		  __entry->hung_engines ? " (":"",
+		  __entry->hung_engines & RENDER_RING ? " [RCS] " : "",
+		  __entry->hung_engines & BSD_RING ? 	" [VCS] " : "",
+		  __entry->hung_engines & BLT_RING ? 	" [BCS] " : "",
+		  __entry->hung_engines & VEBOX_RING ? 	" [VECS] " : "",
+		  __entry->hung_engines & BSD2_RING ? 	" [VCS2] " : "",
+		  __entry->hung_engines ? ")":"",
+		  __entry->watchdog ? "true" : "false",
+		  __entry->full_reset ?
+			(__entry->hung_engines ? "true [PROMOTED]" : "true") :
+				"false")
+);
+
+/**
+ * DOC: i915_tdr_engine_save
+ *
+ * This tracepoint tracks the point of engine state save during the engine
+ * recovery path. Logs the head pointer position at point of hang, the position
+ * after recovering and whether or not we forced a head pointer advancement or
+ * rounded up to an aligned QWORD position.
+ */
+TRACE_EVENT(i915_tdr_engine_save,
+	TP_PROTO(struct intel_engine_cs *engine,
+		 u32 old_head,
+		 u32 new_head,
+		 bool forced_advance),
+
+	TP_ARGS(engine, old_head, new_head, forced_advance),
+
+	TP_STRUCT__entry(
+			__field(struct intel_engine_cs *, engine)
+			__field(u32, old_head)
+			__field(u32, new_head)
+			__field(bool, forced_advance)
+	),
+
+	TP_fast_assign(
+			__entry->engine = engine;
+			__entry->old_head = old_head;
+			__entry->new_head = new_head;
+			__entry->forced_advance = forced_advance;
+	),
+
+	TP_printk("dev=%u, engine=%s, old_head=%u, new_head=%u, forced_advance=%s",
+		  __entry->engine->dev->primary->index,
+		  __entry->engine->name,
+		  __entry->old_head,
+		  __entry->new_head,
+		  __entry->forced_advance ? "true" : "false")
+);
+
+/**
+ * DOC: i915_tdr_gpu_reset_complete
+ *
+ * This tracepoint tracks the point of full GPU reset completion
+ */
+TRACE_EVENT(i915_tdr_gpu_reset_complete,
+	TP_PROTO(struct drm_device *dev),
+
+	TP_ARGS(dev),
+
+	TP_STRUCT__entry(
+			__field(struct drm_device *, dev)
+	),
+
+	TP_fast_assign(
+			__entry->dev = dev;
+	),
+
+	TP_printk("dev=%u, resets=%u",
+		__entry->dev->primary->index,
+		i915_reset_count(&((struct drm_i915_private *)
+			(__entry->dev)->dev_private)->gpu_error) )
+);
+
+/**
+ * DOC: i915_tdr_engine_reset_complete
+ *
+ * This tracepoint tracks the point of engine reset completion
+ */
+TRACE_EVENT(i915_tdr_engine_reset_complete,
+	TP_PROTO(struct intel_engine_cs *engine),
+
+	TP_ARGS(engine),
+
+	TP_STRUCT__entry(
+			__field(struct intel_engine_cs *, engine)
+	),
+
+	TP_fast_assign(
+			__entry->engine = engine;
+	),
+
+	TP_printk("dev=%u, engine=%s, resets=%u",
+		  __entry->engine->dev->primary->index,
+		  __entry->engine->name,
+		  __entry->engine->hangcheck.reset_count)
+);
+
+/**
+ * DOC: i915_tdr_forced_csb_check
+ *
+ * This tracepoint tracks the occurences of forced CSB checks
+ * that the driver does when detecting inconsistent context
+ * submission states between the driver state and the current
+ * CPU engine state.
+ */
+TRACE_EVENT(i915_tdr_forced_csb_check,
+	TP_PROTO(struct intel_engine_cs *engine,
+		 bool was_effective),
+
+	TP_ARGS(engine, was_effective),
+
+	TP_STRUCT__entry(
+			__field(struct intel_engine_cs *, engine)
+			__field(bool, was_effective)
+	),
+
+	TP_fast_assign(
+			__entry->engine = engine;
+			__entry->was_effective = was_effective;
+	),
+
+	TP_printk("dev=%u, engine=%s, was_effective=%s",
+		  __entry->engine->dev->primary->index,
+		  __entry->engine->name,
+		  __entry->was_effective ? "yes" : "no")
+);
+
+/**
+ * DOC: i915_tdr_hang_check
+ *
+ * This tracepoint tracks hang checks on each engine.
+ */
+TRACE_EVENT(i915_tdr_hang_check,
+	TP_PROTO(struct intel_engine_cs *engine,
+		 u32 seqno,
+		 u64 acthd,
+		 bool busy,
+		 enum context_submission_status status),
+
+	TP_ARGS(engine, seqno, acthd, busy, status),
+
+	TP_STRUCT__entry(
+			__field(struct intel_engine_cs *, engine)
+			__field(u32, seqno)
+			__field(u64, acthd)
+			__field(bool, busy)
+			__field(enum context_submission_status, status)
+	),
+
+	TP_fast_assign(
+			__entry->engine = engine;
+			__entry->seqno = seqno;
+			__entry->acthd = acthd;
+			__entry->busy = busy;
+			__entry->status = status;
+	),
+
+	TP_printk("dev=%u, engine=%s, seqno=%u, last seqno=%u, acthd=%lu, score=%d%s, action=%u [%s], busy=%s, status=%u [%s]",
+		  __entry->engine->dev->primary->index,
+		  __entry->engine->name,
+		  __entry->seqno,
+		  __entry->engine->hangcheck.seqno,
+		  (long unsigned int) __entry->acthd,
+		  __entry->engine->hangcheck.score,
+		  (__entry->engine->hangcheck.score >= HANGCHECK_SCORE_RING_HUNG) ? " [HUNG]" : "",
+		  (unsigned int) __entry->engine->hangcheck.action,
+		  hangcheck_action_to_str(__entry->engine->hangcheck.action),
+		  __entry->busy ? "yes" : "no",
+		  __entry->status,
+		  i915_context_submission_status_to_str(__entry->status))
+);
+
 #endif /* _I915_TRACE_H_ */
 
 /* This part must be outside protection */

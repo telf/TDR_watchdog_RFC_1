@@ -36,6 +36,7 @@
 #include "i915_drv.h"
 #include "i915_trace.h"
 #include "intel_drv.h"
+#include "intel_lrc_tdr.h"
 
 /**
  * DOC: interrupt handling
@@ -1286,7 +1287,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 			ret = IRQ_HANDLED;
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_RCS_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[RCS]);
+				intel_lrc_irq_handler(&dev_priv->ring[RCS], true);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_RCS_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[RCS]);
 			if (tmp & (GT_GEN8_RCS_WATCHDOG_INTERRUPT << GEN8_RCS_IRQ_SHIFT)) {
@@ -1303,7 +1304,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 			}
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_BCS_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[BCS]);
+				intel_lrc_irq_handler(&dev_priv->ring[BCS], true);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_BCS_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[BCS]);
 		} else
@@ -1317,7 +1318,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 			ret = IRQ_HANDLED;
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS1_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[VCS]);
+				intel_lrc_irq_handler(&dev_priv->ring[VCS], true);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VCS1_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[VCS]);
 			if (tmp & (GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS1_IRQ_SHIFT)) {
@@ -1334,7 +1335,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 			}
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS2_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[VCS2]);
+				intel_lrc_irq_handler(&dev_priv->ring[VCS2], true);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VCS2_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[VCS2]);
 			if (tmp & (GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS2_IRQ_SHIFT)) {
@@ -1360,7 +1361,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 			ret = IRQ_HANDLED;
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VECS_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[VECS]);
+				intel_lrc_irq_handler(&dev_priv->ring[VECS], true);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VECS_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[VECS]);
 		} else
@@ -3050,6 +3051,27 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
 	return HANGCHECK_HUNG;
 }
 
+static void check_ctx_submission_consistency(struct drm_i915_private *dev_priv,
+				   struct intel_engine_cs *engine,
+				   enum context_submission_status status)
+{
+	struct intel_ring_hangcheck *hc = &engine->hangcheck;
+
+	if (status == CONTEXT_SUBMISSION_STATUS_INCONSISTENT) {
+		if (hc->inconsistent_ctx_status_cnt++ >
+			I915_FAKED_CONTEXT_IRQ_THRESHOLD) {
+
+			DRM_ERROR("Inconsistent context submission state. " \
+				  "Faking interrupt on %s!\n", engine->name);
+
+			intel_execlists_TDR_force_CSB_check(dev_priv, engine);
+			hc->inconsistent_ctx_status_cnt = 0;
+		}
+	}
+	else
+		hc->inconsistent_ctx_status_cnt = 0;
+}
+
 /*
  * This is called when the chip hasn't reported back with completed
  * batchbuffers in a long time. We keep track per ring seqno progress and
@@ -3070,9 +3092,42 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 	int busy_count = 0;
 	bool stuck[I915_NUM_RINGS] = { 0 };
 	bool force_full_gpu_reset = false;
+	enum context_submission_status status[I915_NUM_RINGS] =
+		{ CONTEXT_SUBMISSION_STATUS_OK };
 #define BUSY 1
 #define KICK 5
 #define HUNG 20
+
+	/*
+	 * In execlist mode we need to check for inconsistent context
+	 * submission states regardless if we want to actually check for hangs
+	 * or not since watchdog timeout is dependent on per-engine recovery
+	 * working properly, which will not be the case if there is an
+	 * inconsistent submission state between hardware and driver.
+	 */
+	if (i915.enable_execlists)
+		for_each_ring(ring, dev_priv, i) {
+			status[i] = intel_execlists_TDR_get_current_request(ring, NULL);
+			check_ctx_submission_consistency(dev_priv,
+							 ring,
+							 status[i]);
+
+			/*
+			 * Work is still pending! If hang checking is turned on
+			 * then go through the normal hang check procedure.
+			 * Otherwise we obviously don't do the normal busyness
+			 * check but instead go for a simple check of the
+			 * execlist queues to see if there's work pending. If
+			 * so, there's the potential for an inconsistent
+			 * context submission state so we must keep hang
+			 * checking.
+			 */
+			if (!i915.enable_hangcheck &&
+			   (status[i] != CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED)) {
+				 i915_queue_hangcheck(dev);
+				 return;
+			}
+		}
 
 	if (!i915.enable_hangcheck)
 		return;
@@ -3160,7 +3215,17 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 	}
 
 	for_each_ring(ring, dev_priv, i) {
-		if (ring->hangcheck.score >= HANGCHECK_SCORE_RING_HUNG) {
+		/*
+		 * If the engine is hung but the context submission state is
+		 * inconsistent we cannot attempt recovery since we have no way
+		 * of resubmitting the context. Trying to do so would just
+		 * cause unforseen preemptions. At the top of this function we
+		 * check for - and attempt to rectify - any inconsistencies so
+		 * that future hang checks can safely proceed to recover from
+		 * the hang.
+		 */
+		if ((ring->hangcheck.score >= HANGCHECK_SCORE_RING_HUNG) &&
+		    (status[i] == CONTEXT_SUBMISSION_STATUS_OK)) {
 			DRM_INFO("%s on %s\n",
 				 stuck[i] ? "stuck" : "no progress",
 				 ring->name);

@@ -784,10 +784,12 @@ i915_hangcheck_init(struct drm_device *dev)
 
 	for (i = 0; i < I915_NUM_RINGS; i++) {
 		struct intel_engine_cs *engine = &dev_priv->ring[i];
+		struct intel_ring_hangcheck *hc = &engine->hangcheck;
 
 		i915_hangcheck_reinit(engine);
-		engine->hangcheck.reset_count = 0;
-		engine->hangcheck.tdr_count = 0;
+		hc->reset_count = 0;
+		hc->tdr_count = 0;
+		hc->inconsistent_ctx_status_cnt = 0;
 	}
 }
 

@@ -141,6 +141,20 @@ struct intel_ring_hangcheck {
 
 	/* Number of watchdog hang detections for this ring */
 	u32 watchdog_count;
+
+	/*
+	 * Number of detected context submission status
+	 * inconsistencies
+	 */
+	u32 inconsistent_ctx_status_cnt;
+
+	/*
+	 * Number of detected context submission status
+	 * inconsistencies before faking the context event IRQ
+	 * that is presumed missing.
+	 */
+#define I915_FAKED_CONTEXT_IRQ_THRESHOLD 1
+
 };
 
 struct intel_ringbuffer {

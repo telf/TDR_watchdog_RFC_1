@@ -641,7 +641,7 @@ static bool execlists_check_remove_request(struct intel_engine_cs *ring,
  * Check the unread Context Status Buffers and manage the submission of new
  * contexts to the ELSP accordingly.
  */
-void intel_lrc_irq_handler(struct intel_engine_cs *ring)
+int intel_lrc_irq_handler(struct intel_engine_cs *ring, bool do_lock)
 {
 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
 	u32 status_pointer;
@@ -653,12 +653,13 @@ void intel_lrc_irq_handler(struct intel_engine_cs *ring)
 
 	status_pointer = I915_READ(RING_CONTEXT_STATUS_PTR(ring));
 
+	if (do_lock)
+		spin_lock(&ring->execlist_lock);
+
 	read_pointer = ring->next_context_status_buffer;
 	write_pointer = status_pointer & 0x07;
 	if (read_pointer > write_pointer)
 		write_pointer += 6;
-
-	spin_lock(&ring->execlist_lock);
 
 	while (read_pointer < write_pointer) {
 		read_pointer++;
@@ -685,13 +686,16 @@ void intel_lrc_irq_handler(struct intel_engine_cs *ring)
 	if (submit_contexts != 0)
 		execlists_context_unqueue(ring);
 
-	spin_unlock(&ring->execlist_lock);
-
 	WARN(submit_contexts > 2, "More than two context complete events?\n");
 	ring->next_context_status_buffer = write_pointer % 6;
 
+	if (do_lock)
+		spin_unlock(&ring->execlist_lock);
+
 	I915_WRITE(RING_CONTEXT_STATUS_PTR(ring),
 		   ((u32)ring->next_context_status_buffer & 0x07) << 8);
+
+	return submit_contexts;
 }
 
 static int execlists_context_queue(struct intel_engine_cs *ring,
@@ -1473,6 +1477,7 @@ static int gen8_init_common_ring(struct intel_engine_cs *ring)
 {
 	struct drm_device *dev = ring->dev;
 	struct drm_i915_private *dev_priv = dev->dev_private;
+	unsigned long flags;
 
 	I915_WRITE_IMR(ring, ~(ring->irq_enable_mask | ring->irq_keep_mask));
 	I915_WRITE(RING_HWSTAM(ring->mmio_base), 0xffffffff);
@@ -1481,7 +1486,11 @@ static int gen8_init_common_ring(struct intel_engine_cs *ring)
 		   _MASKED_BIT_DISABLE(GFX_REPLAY_MODE) |
 		   _MASKED_BIT_ENABLE(GFX_RUN_LIST_ENABLE));
 	POSTING_READ(RING_MODE_GEN7(ring));
+
+	spin_lock_irqsave(&ring->execlist_lock, flags);
 	ring->next_context_status_buffer = 0;
+	spin_unlock_irqrestore(&ring->execlist_lock, flags);
+
 	DRM_DEBUG_DRIVER("Execlists enabled for %s\n", ring->name);
 
 	i915_hangcheck_reinit(ring);
@@ -2703,3 +2712,75 @@ intel_execlists_TDR_get_current_request(struct intel_engine_cs *ring,
 
 	return status;
 }
+
+/**
+ * execlists_TDR_force_CSB_check() - check CSB manually to act on pending
+ * context status events.
+ *
+ * @dev_priv: ...
+ * @engine: engine whose CSB is to be checked.
+ *
+ * In case we missed a context event interrupt we can fake this interrupt by
+ * acting on pending CSB events manually by calling this function. This is
+ * normally what would happen in interrupt context but that does not prevent us
+ * from calling it from a user thread.
+ */
+void intel_execlists_TDR_force_CSB_check(struct drm_i915_private *dev_priv,
+					 struct intel_engine_cs *engine)
+{
+	unsigned long flags;
+	bool hw_active;
+	int was_effective;
+
+	if (atomic_read(&engine->hangcheck.flags)
+		& I915_ENGINE_RESET_IN_PROGRESS) {
+
+		/*
+		 * Normally it's not a problem to fake context event interrupts
+		 * at any point even though the real interrupt might come in as
+		 * well. However, following a per-engine reset the read pointer
+		 * is set to 0 and the write pointer is set to 7.
+		 * Seeing as 7 % 6 = 1 (% 6 meaning there are 6 event slots),
+		 * which is 1 above the post-reset read pointer position, that
+		 * means that we've got a CSB window of non-zero size that
+		 * might be populated with context events by the hardware
+		 * following the TDR context resubmission. If we do a faked
+		 * interrupt too early (before finishing hang recovery) we
+		 * clear out this window by setting read pointer = write
+		 * pointer = 1 expecting that all contained events have been
+		 * processed (following a reset there will be nothing but
+		 * zeroes in there, though). This does not prevent the hardware
+		 * from filling in CSB slots 0 and 1 with events after this
+		 * point in time, though. By checking the CSB before allowing
+		 * the hardware fill in the events we hide these events from
+		 * being processed, potentially causing irrecoverable hangs.
+		 *
+		 * Solution: Do not fake interrupts while hang recovery is ongoing.
+		 */
+		DRM_ERROR("Hang recovery in progress. Abort %s CSB check!\n",
+			engine->name);
+
+		return;
+	}
+
+	hw_active =
+		(I915_READ(RING_EXECLIST_STATUS(engine)) &
+			EXECLIST_STATUS_CURRENT_ACTIVE_ELEMENT_STATUS) ?
+				true : false;
+	if (hw_active) {
+		u32 hw_context;
+
+		hw_context = I915_READ(RING_EXECLIST_STATUS_CTX_ID(engine));
+		WARN(hw_active, "Context (%x) executing on %s - " \
+				"No need for faked IRQ!\n",
+				hw_context, engine->name);
+	}
+
+	spin_lock_irqsave(&engine->execlist_lock, flags);
+	if (!(was_effective = intel_lrc_irq_handler(engine, false)))
+		DRM_ERROR("Forced CSB check of %s ineffective!\n", engine->name);
+	spin_unlock_irqrestore(&engine->execlist_lock, flags);
+
+	wake_up_all(&engine->irq_queue);
+}
+

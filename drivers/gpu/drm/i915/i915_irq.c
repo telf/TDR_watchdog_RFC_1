@@ -36,6 +36,7 @@
 #include "i915_drv.h"
 #include "i915_trace.h"
 #include "intel_drv.h"
+#include "intel_lrc_tdr.h"
 
 /**
  * DOC: interrupt handling
@@ -1286,7 +1287,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 			ret = IRQ_HANDLED;
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_RCS_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[RCS]);
+				intel_lrc_irq_handler(&dev_priv->ring[RCS], true);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_RCS_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[RCS]);
 			if (tmp & (GT_GEN8_RCS_WATCHDOG_INTERRUPT << GEN8_RCS_IRQ_SHIFT)) {
@@ -1303,7 +1304,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 			}
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_BCS_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[BCS]);
+				intel_lrc_irq_handler(&dev_priv->ring[BCS], true);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_BCS_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[BCS]);
 		} else
@@ -1317,7 +1318,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 			ret = IRQ_HANDLED;
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS1_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[VCS]);
+				intel_lrc_irq_handler(&dev_priv->ring[VCS], true);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VCS1_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[VCS]);
 			if (tmp & (GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS1_IRQ_SHIFT)) {
@@ -1334,7 +1335,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 			}
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS2_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[VCS2]);
+				intel_lrc_irq_handler(&dev_priv->ring[VCS2], true);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VCS2_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[VCS2]);
 			if (tmp & (GT_GEN8_VCS_WATCHDOG_INTERRUPT << GEN8_VCS2_IRQ_SHIFT)) {
@@ -1360,7 +1361,7 @@ static irqreturn_t gen8_gt_irq_handler(struct drm_i915_private *dev_priv,
 			ret = IRQ_HANDLED;
 
 			if (tmp & (GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VECS_IRQ_SHIFT))
-				intel_lrc_irq_handler(&dev_priv->ring[VECS]);
+				intel_lrc_irq_handler(&dev_priv->ring[VECS], true);
 			if (tmp & (GT_RENDER_USER_INTERRUPT << GEN8_VECS_IRQ_SHIFT))
 				notify_ring(&dev_priv->ring[VECS]);
 		} else
@@ -2380,27 +2381,6 @@ static void i915_error_work_func(struct work_struct *work)
 			reset_complete = true;
 
 			ret = i915_reset_engine(ring);
-
-			/*
-			 * Execlist mode only:
-			 *
-			 * -EAGAIN means that between detecting a hang (and
-			 * also determining that the currently submitted
-			 * context is stable and valid) and trying to recover
-			 * from the hang the current context changed state.
-			 * This means that we are probably not completely hung
-			 * after all. Just fail and retry by exiting all the
-			 * way back and wait for the next hang detection. If we
-			 * have a true hang on our hands then we will detect it
-			 * again, otherwise we will continue like nothing
-			 * happened.
-			 */
-			if (ret == -EAGAIN) {
-				DRM_ERROR("Reset of %s aborted due to " \
-					  "change in context submission " \
-					  "state - retrying!", ring->name);
-				ret = 0;
-			}
 
 			if (ret) {
 				DRM_ERROR("Reset of %s failed! (%d)", ring->name, ret);

@@ -917,6 +917,71 @@ int i915_reset(struct drm_device *dev)
 	return 0;
 }
 
+static bool i915_gem_reset_engine_CSSC_precheck(
+		struct drm_i915_private *dev_priv,
+		struct intel_engine_cs *engine,
+		struct drm_i915_gem_request **req,
+		int *ret)
+{
+	bool precheck_ok = true;
+	enum context_submission_status status;
+
+	WARN_ON(!ret);
+
+	*ret = 0;
+
+	status = intel_execlists_TDR_get_current_request(engine, req);
+
+	/*
+	 * If the hardware and driver states do not coincide
+	 * or if there for some reason is no current context
+	 * in the process of being submitted then bail out and
+	 * try again. Do not proceed unless we have reliable
+	 * current context state information.
+	 */
+	if (status == CONTEXT_SUBMISSION_STATUS_NONE_SUBMITTED) {
+		/*
+		 * No work in flight. This state is possible to get
+		 * into if calling the error handler directly from
+		 * debugfs.  Just do early exit and forget it happened.
+		 */
+		WARN(1, "No work in flight! Aborting recovery on %s\n",
+			engine->name);
+
+		 precheck_ok = false;
+		 *ret = 0;
+
+	} else if (status == CONTEXT_SUBMISSION_STATUS_INCONSISTENT) {
+		if (!intel_execlists_TDR_force_CSB_check(dev_priv, engine)) {
+			/*
+			 * Context submission state is inconsistent and
+			 * faking a context event IRQ did not help.
+			 * Fail and promote to higher level of
+			 * recovery!
+			 */
+			precheck_ok = false;
+			*ret = -EINVAL;
+		} else {
+			/*
+			 * Rectifying the inconsistent context
+			 * submission status helped! No reset required,
+			 * just exit and move on!
+			 */
+			 precheck_ok = false;
+			 *ret = 0;
+		}
+
+	} else if (status != CONTEXT_SUBMISSION_STATUS_OK) {
+		WARN(1, "Unexpected context submission status (%u) on %s\n",
+			status, engine->name);
+
+		precheck_ok = false;
+		*ret = -EINVAL;
+	}
+
+	return precheck_ok;
+}
+
 /**
  * i915_reset_engine - reset GPU engine after a hang
  * @engine: engine to reset
@@ -958,20 +1023,17 @@ int i915_reset_engine(struct intel_engine_cs *engine)
 	i915_gem_reset_ring_status(dev_priv, engine);
 
 	if (i915.enable_execlists) {
-		enum context_submission_status status =
-			intel_execlists_TDR_get_current_request(engine, NULL);
-
 		/*
-		 * If the hardware and driver states do not coincide
-		 * or if there for some reason is no current context
-		 * in the process of being submitted then bail out and
-		 * try again. Do not proceed unless we have reliable
-		 * current context state information.
+		 * Check context submission status consistency (CSSC) before
+		 * moving on. If the driver and hardware have different
+		 * opinions about what is going on just fail and escalate to a
+		 * higher form of hang recovery.
 		 */
-		if (status != CONTEXT_SUBMISSION_STATUS_OK) {
-			ret = -EAGAIN;
+		 if (!i915_gem_reset_engine_CSSC_precheck(dev_priv,
+							  engine,
+							  NULL,
+							  &ret))
 			goto reset_engine_error;
-		}
 	}
 
 	ret = intel_ring_disable(engine);
@@ -981,27 +1043,21 @@ int i915_reset_engine(struct intel_engine_cs *engine)
 	}
 
 	if (i915.enable_execlists) {
-		enum context_submission_status status;
-		bool inconsistent;
-
-		status = intel_execlists_TDR_get_current_request(engine,
-				&current_request);
-
-		inconsistent = (status != CONTEXT_SUBMISSION_STATUS_OK);
-		if (inconsistent) {
-			/*
-			 * If we somehow have reached this point with
-			 * an inconsistent context submission status then
-			 * back out of the previously requested reset and
-			 * retry later.
-			 */
-			WARN(inconsistent,
-			     "Inconsistent context status on %s: %u\n",
-			     engine->name, status);
-
-			ret = -EAGAIN;
+		/*
+		 * Get a hold of the currently executing context.
+		 *
+		 * Context submission status consistency is done implicitly so
+		 * we might as well check it post-engine disablement since we
+		 * get that option for free. Also, it's conceivable that the
+		 * context submission state might have changed as part of the
+		 * reset request on gen8+ so it's not completely devoid of
+		 * value to do this.
+		 */
+		 if (!i915_gem_reset_engine_CSSC_precheck(dev_priv,
+							  engine,
+							  &current_request,
+							  &ret))
 			goto reenable_reset_engine_error;
-		}
 	}
 
 	/* Sample the current ring head position */

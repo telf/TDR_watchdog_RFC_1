@@ -32,5 +32,8 @@ enum context_submission_status
 intel_execlists_TDR_get_current_request(struct intel_engine_cs *ring,
 		struct drm_i915_gem_request **req);
 
+bool intel_execlists_TDR_force_CSB_check(struct drm_i915_private *dev_priv,
+					 struct intel_engine_cs *engine);
+
 #endif /* _INTEL_LRC_TDR_H_ */
 

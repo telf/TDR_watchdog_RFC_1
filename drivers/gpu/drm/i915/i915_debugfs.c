@@ -2030,7 +2030,7 @@ static int i915_execlists(struct seq_file *m, void *data)
 		seq_printf(m, "%s\n", ring->name);
 
 		status = I915_READ(RING_EXECLIST_STATUS(ring));
-		ctx_id = I915_READ(RING_EXECLIST_STATUS(ring) + 4);
+		ctx_id = I915_READ(RING_EXECLIST_STATUS_CTX_ID(ring));
 		seq_printf(m, "\tExeclist status: 0x%08X, context: %u\n",
 			   status, ctx_id);
 
@@ -4164,11 +4164,50 @@ i915_wedged_get(void *data, u64 *val)
 	return 0;
 }
 
+static const char *ringid_to_str(enum intel_ring_id ring_id)
+{
+	switch (ring_id) {
+	case RCS:
+		return "RCS";
+	case VCS:
+		return "VCS";
+	case BCS:
+		return "BCS";
+	case VECS:
+		return "VECS";
+	case VCS2:
+		return "VCS2";
+	}
+
+	return "unknown";
+}
+
 static int
 i915_wedged_set(void *data, u64 val)
 {
 	struct drm_device *dev = data;
 	struct drm_i915_private *dev_priv = dev->dev_private;
+	struct intel_engine_cs *engine;
+	const u32 engine_mask = ((1 << I915_NUM_RINGS) - 1);
+	const u32 single_engine_reset_mask = 0xF;
+	const u32 bitfield_boundary = 8;
+	u32 val_mask = 0;
+	u32 i;
+#define ENGINE_MSGLEN 64
+	char msg[ENGINE_MSGLEN] = "";
+
+	/*
+	 * Val can contain values in one of the following mutally exclusive
+	 * formats:
+	 *
+	 * 1. Bits [3:0] != 0x0 :
+	 *	Index (0 .. I915_NUM_RINGS-1) of engine to be manually reset.
+	 *	Invalid indices translate to full gpu reset.
+	 *
+	 * 2. Bits [(I915_NUM_RINGS-1)+8 : 8] != 0x0 :
+	 *	Bit mask containing the engine flags of all the engines that
+	 *	are to be manually reset.
+	 */
 
 	/*
 	 * There is no safeguard against this debugfs entry colliding
@@ -4177,14 +4216,61 @@ i915_wedged_set(void *data, u64 val)
 	 * test harness is responsible enough not to inject gpu hangs
 	 * while it is writing to 'i915_wedged'
 	 */
-
-	if (i915_reset_in_progress(&dev_priv->gpu_error))
+	if (i915_gem_check_wedge(dev_priv, NULL, true))
 		return -EAGAIN;
 
 	intel_runtime_pm_get(dev_priv);
 
-	i915_handle_error(dev, 0x0, false, val,
-			  "Manually setting wedged to %llu", val);
+	if (!val || (single_engine_reset_mask & val)) {
+		/*
+		 * Single engine hang mode
+		 *
+		 * Bits [3:0] of val contains index of engine
+		 * to be manually reset.
+		 */
+		val &= single_engine_reset_mask;
+		if (val == single_engine_reset_mask)
+			val_mask = 0x0;
+		else
+			val_mask = (1 << (val & 0xF));
+
+	} else {
+		/*
+		 * Mask mode
+		 *
+		 * Bits [31:8] of val contains bit mask of engines to be
+		 * manually reset, engine index 0 at bit 4, engine index 1 at
+		 * bit 5 and so forth.
+		 */
+		val_mask = (val >> bitfield_boundary) & engine_mask;
+	}
+
+
+	if (val_mask) {
+		u32 len;
+
+		len = scnprintf(msg, sizeof(msg), "Manual reset:");
+
+		/* Assemble message string */
+		for_each_ring(engine, dev_priv, i)
+			if (intel_ring_flag(engine) & val_mask) {
+				DRM_INFO("Manual reset: %s\n", engine->name);
+
+				len += scnprintf(msg + len, sizeof(msg) - len,
+						 "%s [%s]",
+						 msg,
+						 ringid_to_str(i));
+			}
+
+	} else {
+		scnprintf(msg, sizeof(msg), "Manual global reset");
+	}
+
+	i915_handle_error(dev,
+			  val_mask,
+			  false,
+			  true,
+			  msg);
 
 	intel_runtime_pm_put(dev_priv);
 
@@ -4194,6 +4280,55 @@ i915_wedged_set(void *data, u64 val)
 DEFINE_SIMPLE_ATTRIBUTE(i915_wedged_fops,
 			i915_wedged_get, i915_wedged_set,
 			"%llu\n");
+
+static ssize_t
+i915_ring_hangcheck_read(struct file *filp, char __user *ubuf,
+			 size_t max, loff_t *ppos)
+{
+	int i;
+	int len;
+	char buf[300];
+	struct drm_device *dev = filp->private_data;
+	struct drm_i915_private *dev_priv = dev->dev_private;
+
+	/*
+	 * Returns the total number of times the rings
+	 * have hung and been reset since boot
+	 */
+	len = scnprintf(buf, sizeof(buf), "GPU=0x%08X,",
+			i915_reset_count(&dev_priv->gpu_error));
+	for (i = 0; i < I915_NUM_RINGS; ++i)
+		len += scnprintf(buf + len, sizeof(buf) - len,
+				 "%s=0x%08lX,",
+				 ringid_to_str(i),
+				 (long unsigned)
+				 dev_priv->ring[i].hangcheck.reset_count);
+
+	for (i = 0; i < I915_NUM_RINGS; ++i)
+		len += scnprintf(buf + len, sizeof(buf) - len,
+				 "%s_T=0x%08lX,",
+				 ringid_to_str(i),
+				 (long unsigned)
+				 dev_priv->ring[i].hangcheck.tdr_count);
+
+	for (i = 0; i < I915_NUM_RINGS; ++i)
+		len += scnprintf(buf + len, sizeof(buf) - len,
+				 "%s_W=0x%08lX,",
+				 ringid_to_str(i),
+				 (long unsigned)
+				 dev_priv->ring[i].hangcheck.watchdog_count);
+
+	len += scnprintf(buf + len - 1, sizeof(buf) - len, "\n");
+
+	return simple_read_from_buffer(ubuf, max, ppos, buf, len);
+}
+
+static const struct file_operations i915_ring_hangcheck_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = i915_ring_hangcheck_read,
+	.llseek = default_llseek,
+};
 
 static int
 i915_ring_stop_get(void *data, u64 *val)
@@ -4825,6 +4960,7 @@ static const struct i915_debugfs_files {
 	{"i915_ring_missed_irq", &i915_ring_missed_irq_fops},
 	{"i915_ring_test_irq", &i915_ring_test_irq_fops},
 	{"i915_gem_drop_caches", &i915_drop_caches_fops},
+	{"i915_ring_hangcheck", &i915_ring_hangcheck_fops},
 	{"i915_error_state", &i915_error_state_fops},
 	{"i915_next_seqno", &i915_next_seqno_fops},
 	{"i915_display_crc_ctl", &i915_display_crc_ctl_fops},

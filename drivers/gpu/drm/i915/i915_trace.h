@@ -556,8 +556,8 @@ DEFINE_EVENT(i915_gem_request, i915_gem_request_complete,
 );
 
 TRACE_EVENT(i915_gem_request_wait_begin,
-	    TP_PROTO(struct drm_i915_gem_request *req),
-	    TP_ARGS(req),
+	    TP_PROTO(struct drm_i915_gem_request *req, bool blocking),
+	    TP_ARGS(req, blocking),
 
 	    TP_STRUCT__entry(
 			     __field(u32, dev)
@@ -566,25 +566,18 @@ TRACE_EVENT(i915_gem_request_wait_begin,
 			     __field(bool, blocking)
 			     ),
 
-	    /* NB: the blocking information is racy since mutex_is_locked
-	     * doesn't check that the current thread holds the lock. The only
-	     * other option would be to pass the boolean information of whether
-	     * or not the class was blocking down through the stack which is
-	     * less desirable.
-	     */
 	    TP_fast_assign(
 			   struct intel_engine_cs *ring =
 						i915_gem_request_get_ring(req);
 			   __entry->dev = ring->dev->primary->index;
 			   __entry->ring = ring->id;
 			   __entry->seqno = i915_gem_request_get_seqno(req);
-			   __entry->blocking =
-				     mutex_is_locked(&ring->dev->struct_mutex);
+			   __entry->blocking = blocking;
 			   ),
 
 	    TP_printk("dev=%u, ring=%u, seqno=%u, blocking=%s",
 		      __entry->dev, __entry->ring,
-		      __entry->seqno, __entry->blocking ?  "yes (NB)" : "no")
+		      __entry->seqno, __entry->blocking ?  "yes" : "no")
 );
 
 DEFINE_EVENT(i915_gem_request, i915_gem_request_wait_end,

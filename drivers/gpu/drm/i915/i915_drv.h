@@ -2781,6 +2781,8 @@ static inline bool i915_stop_ring_allow_warn(struct drm_i915_private *dev_priv)
 }
 
 void i915_gem_reset(struct drm_device *dev);
+void i915_gem_reset_ring_status(struct drm_i915_private *dev_priv,
+			        struct intel_engine_cs *ring);
 bool i915_gem_clflush_object(struct drm_i915_gem_object *obj, bool force);
 int __must_check i915_gem_object_finish_gpu(struct drm_i915_gem_object *obj);
 int __must_check i915_gem_init(struct drm_device *dev);

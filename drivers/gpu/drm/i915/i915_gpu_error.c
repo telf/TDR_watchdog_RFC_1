@@ -303,6 +303,9 @@ static void i915_ring_error_state(struct drm_i915_error_state_buf *m,
 	err_printf(m, "  hangcheck: %s [%d]\n",
 		   hangcheck_action_to_str(ring->hangcheck_action),
 		   ring->hangcheck_score);
+	err_printf(m, "  TDR count: %d\n", ring->hangcheck_tdr_count);
+	err_printf(m, "  Watchdog count: %d\n", ring->hangcheck_watchdog_count);
+	err_printf(m, "  Engine reset count: %d\n", ring->hangcheck_reset_count);
 }
 
 void i915_error_printf(struct drm_i915_error_state_buf *e, const char *f, ...)
@@ -920,6 +923,9 @@ static void i915_record_ring_state(struct drm_device *dev,
 
 	ering->hangcheck_score = ring->hangcheck.score;
 	ering->hangcheck_action = ring->hangcheck.action;
+	ering->hangcheck_tdr_count = ring->hangcheck.tdr_count;
+	ering->hangcheck_watchdog_count = ring->hangcheck.watchdog_count;
+	ering->hangcheck_reset_count = ring->hangcheck.reset_count;
 
 	if (USES_PPGTT(dev)) {
 		int i;

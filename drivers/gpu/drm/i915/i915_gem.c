@@ -1233,7 +1233,8 @@ int __i915_wait_request(struct drm_i915_gem_request *req,
 			unsigned reset_counter,
 			bool interruptible,
 			s64 *timeout,
-			struct drm_i915_file_private *file_priv)
+			struct drm_i915_file_private *file_priv,
+			bool is_locked)
 {
 	struct intel_engine_cs *ring = i915_gem_request_get_ring(req);
 	struct drm_device *dev = ring->dev;
@@ -1376,7 +1377,7 @@ i915_wait_request(struct drm_i915_gem_request *req)
 	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
 	i915_gem_request_reference(req);
 	ret = __i915_wait_request(req, reset_counter,
-				  interruptible, NULL, NULL);
+				  interruptible, NULL, NULL, true);
 	i915_gem_request_unreference(req);
 	return ret;
 }
@@ -1456,7 +1457,7 @@ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
 	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
 	i915_gem_request_reference(req);
 	mutex_unlock(&dev->struct_mutex);
-	ret = __i915_wait_request(req, reset_counter, true, NULL, file_priv);
+	ret = __i915_wait_request(req, reset_counter, true, NULL, file_priv, false);
 	mutex_lock(&dev->struct_mutex);
 	i915_gem_request_unreference(req);
 	if (ret)
@@ -2950,7 +2951,7 @@ i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
 
 	ret = __i915_wait_request(req, reset_counter, true,
 				  args->timeout_ns > 0 ? &args->timeout_ns : NULL,
-				  file->driver_priv);
+				  file->driver_priv, false);
 	i915_gem_request_unreference__unlocked(req);
 	return ret;
 
@@ -4139,7 +4140,7 @@ i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
 	if (target == NULL)
 		return 0;
 
-	ret = __i915_wait_request(target, reset_counter, true, NULL, NULL);
+	ret = __i915_wait_request(target, reset_counter, true, NULL, NULL, false);
 	if (ret == 0)
 		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work, 0);
 

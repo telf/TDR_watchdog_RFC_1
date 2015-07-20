@@ -10358,7 +10358,7 @@ static void intel_mmio_flip_work_func(struct work_struct *work)
 	if (mmio_flip->req)
 		WARN_ON(__i915_wait_request(mmio_flip->req,
 					    crtc->reset_counter,
-					    false, NULL, NULL) != 0);
+					    false, NULL, NULL, false) != 0);
 
 	intel_do_mmio_flip(crtc);
 	if (mmio_flip->req) {

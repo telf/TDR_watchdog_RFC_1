@@ -220,7 +220,7 @@ static void print_error_buffers(struct drm_i915_error_state_buf *m,
 	}
 }
 
-static const char *hangcheck_action_to_str(enum intel_ring_hangcheck_action a)
+const char *hangcheck_action_to_str(enum intel_ring_hangcheck_action a)
 {
 	switch (a) {
 	case HANGCHECK_IDLE:
